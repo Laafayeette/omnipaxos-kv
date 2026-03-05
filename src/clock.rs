@@ -34,9 +34,9 @@ impl ClockSimulator {
 
         // Calculate the drift in microseconds: (seconds elapsed * drift rate)
         let drift_offset = (elapsed_real_secs * self.drift_rate) as i64;
-        // Simulated time = Last Synced Time + Real Elapsed (in micros) + Drift
         let elapsed_micros = (elapsed_real_secs * 1_000_000.0) as i64;
 
+        // Simulated time = Last Synced Time + Real Elapsed (in micros) + Drift
         self.last_sync_simulated + elapsed_micros + drift_offset
     }
 

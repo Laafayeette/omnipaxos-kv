@@ -71,3 +71,42 @@ fn test_all_getters() {
 
     println!("✓ All getters working correctly\n");
 }
+
+#[test]
+fn test_sync_clock() {
+    println!("\n=== Testing Clock Synchronization ===");
+    let mut clock = ClockSimulator::new(50.0, 100, Duration::from_secs(60));
+
+    println!("Initial time:");
+    let time1 = clock.get_time();
+    println!("  Time 1: {} μs", time1);
+
+    println!("Sleeping for 200ms to accumulate drift...");
+    std::thread::sleep(Duration::from_millis(200));
+
+    let time2 = clock.get_time();
+    println!("  Time 2 (with drift): {} μs", time2);
+    let drift_accumulated = time2 - time1;
+    println!("  Drift accumulated: {} μs", drift_accumulated);
+
+    println!("Calling sync_clock()...");
+    clock.sync_clock();
+
+    let time3 = clock.get_time();
+    println!("  Time 3 (after sync): {} μs", time3);
+
+    println!("Sleeping for 100ms after sync...");
+    std::thread::sleep(Duration::from_millis(100));
+
+    let time4 = clock.get_time();
+    println!("  Time 4: {} μs", time4);
+    let elapsed_after_sync = time4 - time3;
+    println!("  Elapsed after sync: {} μs", elapsed_after_sync);
+
+    // After sync, drift should reset - elapsed should be close to 100ms, not 300ms
+    assert!(elapsed_after_sync < drift_accumulated, "Drift should have been reset");
+    assert!(elapsed_after_sync >= 100_000, "At least 100ms should have passed");
+    assert!(elapsed_after_sync < 150_000, "Should be close to 100ms, not accumulating old drift");
+
+    println!("✓ Clock sync working correctly - drift was reset\n");
+}
