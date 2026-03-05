@@ -1,3 +1,9 @@
+#[derive(Debug)]
+pub enum ClockSimError {
+    NegativeUncertainty(i64),
+    ZeroSyncInterval,
+    NegativeDriftRate(f64),
+}
 
 use std::time::{Duration,Instant, SystemTime, UNIX_EPOCH};
 pub struct ClockSimulator {
@@ -11,19 +17,30 @@ pub struct ClockSimulator {
 
 impl ClockSimulator {
 
-    pub fn new(drift_rate: f64,uncertainty: i64,sync_interval: Duration)-> Self{
+    pub fn new(drift_rate: f64,uncertainty: i64,sync_interval: Duration)-> Result<Self, ClockSimError>{
+
+        if uncertainty < 0 {
+            return Err(ClockSimError::NegativeUncertainty(uncertainty));
+        }
+        if sync_interval.is_zero() {
+            return Err(ClockSimError::ZeroSyncInterval);
+        }
+        if drift_rate < 0.0 {
+            return Err(ClockSimError::NegativeDriftRate(drift_rate));
+        }
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_micros() as i64;
 
-        Self{
+        Ok(Self {
             drift_rate,
             uncertainty,
             sync_interval,
             last_sync_system: Instant::now(),
             last_sync_simulated: now,
-        }
+        })
 
     }
 
