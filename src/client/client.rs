@@ -67,7 +67,7 @@ impl Client {
         loop {
             tokio::select! {
                 biased;
-                Some(msg) = self.network.server_messages.recv() => {
+                Some(msg) = self.network.server_messages.recv() => { // An indication received back from the server replica
                     self.handle_server_message(msg);
                     if self.run_finished() {
                         break;
@@ -122,10 +122,10 @@ impl Client {
             true => KVCommand::Put(key.clone(), key),
             false => KVCommand::Get(key),
         };
-        let request = ClientMessage::Append(self.next_request_id, cmd);
+        let request = ClientMessage::Append(self.next_request_id, cmd); // Create a command of type ClientMessage::Append
         debug!("Sending {request:?}");
-        self.network.send(self.active_server, request).await;
-        self.client_data.new_request(is_write);
+        self.network.send(self.active_server, request).await; // Who is the active server?
+        self.client_data.new_request(is_write); // Timestamps request with information
         self.next_request_id += 1;
     }
 

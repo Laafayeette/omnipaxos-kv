@@ -111,19 +111,21 @@ impl OmniPaxosServer {
         }
     }
 
+    // Checks whether there has been any new decided entries in its log.
+    // If there are new entries, then read those new entries
+    // And apply them locally .. ?
     fn handle_decided_entries(&mut self) {
         // TODO: Can use a read_raw here to avoid allocation
         let new_decided_idx = self.omnipaxos.get_decided_idx();
         if self.current_decided_idx < new_decided_idx {
             let decided_entries = self
                 .omnipaxos
-                .read_decided_suffix(self.current_decided_idx)
+                .read_decided_suffix(self.current_decided_idx) // Reads ONLY new decided entries
                 .unwrap();
-            self.current_decided_idx = new_decided_idx;
+            self.current_decided_idx = new_decided_idx; // Update existing decided_idx
             debug!("Decided {new_decided_idx}");
-            let decided_commands = decided_entries
-                .into_iter()
-                .filter_map(|e| match e {
+            let decided_commands = decided_entries.into_iter() // Owned iterator, consumes the decided_entries vectors
+                .filter_map(|e| match e { // if e == LogEntry::Decided(Command{id: 7, ...}) then bind cmd = Command{id: 7, ...} and keep it in new array
                     LogEntry::Decided(cmd) => Some(cmd),
                     _ => unreachable!(),
                 })
@@ -132,16 +134,23 @@ impl OmniPaxosServer {
         }
     }
 
+    // Applies decided entries (log commands) to local state machine
+    // After decided entry(s) have been applied locally, replica checks if it was the original recipient of the request
+    // If so, prepares and sends back indication to original client. (Since interface is <req> <indication> then it is only right that the same replica who received the request sends back the indication
     fn update_database_and_respond(&mut self, commands: Vec<Command>) {
         // TODO: batching responses possible here (batch at handle_cluster_messages)
         for command in commands {
-            let read = self.database.handle_command(command.kv_cmd);
-            if command.coordinator_id == self.id {
+            let read = self.database.handle_command(command.kv_cmd); // Applies the command and returns either None or some get-result.
+            if command.coordinator_id == self.id { // Original receiver prepares indication back to client
                 let response = match read {
-                    Some(read_result) => ServerMessage::Read(command.id, read_result),
-                    None => ServerMessage::Write(command.id),
+                    Some(read_result) => ServerMessage::Read(command.id, read_result), // if read happened in handle_command
+                    None => ServerMessage::Write(command.id), // if Write or Delete happened (it returns None at end of handle_command in that case)
                 };
-                self.network.send_to_client(command.client_id, response);
+                // In the above pattern matching we bind the response as to be either a read or write.
+                // If the client requested a read operation, then response (i.e., the read) will be a tuple ServerMessage::Read(command.id, read_result)
+                // And then sent back to the client.
+                // If it was a Write or Delete, then response will be evaluated to a ServerMessage::Write(command.id) and sent to client together with the id of the command.
+                self.network.send_to_client(command.client_id, response); // Sends indication back to original client.
             }
         }
     }
@@ -156,10 +165,15 @@ impl OmniPaxosServer {
         }
     }
 
+    // An incoming GET, PUT, ETC FROM CLIENT
+    // This is where the server processes the incoming message from the client.
+    // It checks to see if the incoming message is an Append, if so, then wraps the command_id and kv_command (GET, ...)
+    // and calls append_to_log with the fields from the message.
+    // The append_to_log wraps an omnipaxos message and calls omnipaxos on itself to append to its local log.
     async fn handle_client_messages(&mut self, messages: &mut Vec<(ClientId, ClientMessage)>) {
         for (from, message) in messages.drain(..) {
             match message {
-                ClientMessage::Append(command_id, kv_command) => {
+                ClientMessage::Append(command_id, kv_command) => { // If it is a client message, then call append_to_log
                     self.append_to_log(from, command_id, kv_command)
                 }
             }
@@ -167,17 +181,16 @@ impl OmniPaxosServer {
         self.send_outgoing_msgs();
     }
 
-    async fn handle_cluster_messages(
-        &mut self,
-        messages: &mut Vec<(NodeId, ClusterMessage)>,
-    ) -> bool {
+    // Triggered when a cluster of messages enters the node from the network.
+    // Pattern matches on what kind of message is arrived
+    async fn handle_cluster_messages(&mut self, messages: &mut Vec<(NodeId, ClusterMessage)>, ) -> bool {
         let mut received_start_signal = false;
         for (from, message) in messages.drain(..) {
             trace!("{}: Received {message:?}", self.id);
-            match message {
-                ClusterMessage::OmniPaxosMessage(m) => {
-                    self.omnipaxos.handle_incoming(m);
-                    self.handle_decided_entries();
+            match message { // What kind of message did we receive through the network?
+                ClusterMessage::OmniPaxosMessage(m) => { // If it's an omnipaxos message
+                    self.omnipaxos.handle_incoming(m); // Pass it to consensus engine (omni paxos). This advances the prepare/accept/accepted/decide internally in omnipaxos
+                    self.handle_decided_entries(); // Check whether that caused new decisions.
                 }
                 ClusterMessage::LeaderStartSignal(start_time) => {
                     debug!("Received start message from peer {from}");
@@ -190,10 +203,12 @@ impl OmniPaxosServer {
         received_start_signal
     }
 
+    // Wraps an API call to the omniPaxos API to append a log to the entry.
+    // Called during handle_client_messages.
     fn append_to_log(&mut self, from: ClientId, command_id: CommandId, kv_command: KVCommand) {
         let command = Command {
             client_id: from,
-            coordinator_id: self.id,
+            coordinator_id: self.id, // Adds its own ID to the command (for further use when indication event happens)
             id: command_id,
             kv_cmd: kv_command,
         };

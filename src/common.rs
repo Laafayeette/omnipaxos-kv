@@ -60,6 +60,8 @@ pub mod kv {
         pub kv_cmd: KVCommand,
     }
 
+    // Original client id (who initializaed the command)
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub enum KVCommand {
         Put(String, String),

@@ -36,6 +36,7 @@ impl ClientData {
         self.request_data.push(data);
     }
 
+    // request_data = [ [request_time, write, response_time], [request_time, write, response_time], ...   ]
     pub fn new_response(&mut self, command_id: CommandId) {
         let response_time = Utc::now().timestamp_millis();
         self.request_data[command_id].response_time = Some(response_time);
