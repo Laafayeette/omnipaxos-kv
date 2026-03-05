@@ -28,5 +28,24 @@ impl ClockSimulator {
     }
 
 
+    pub fn get_time(&self) -> i64{
+
+        let elapsed_real_secs = self.last_sync_system.elapsed().as_secs_f64();
+
+        // Calculate the drift in microseconds: (seconds elapsed * drift rate)
+        let drift_offset = (elapsed_real_secs * self.drift_rate) as i64;
+
+        // Simulated time = Last Synced Time + Real Elapsed (in micros) + Drift
+        let elapsed_micros = (elapsed_real_secs * 1_000_000.0) as i64;
+
+        self.last_sync_simulated + elapsed_micros + drift_offset
+    }
+
+
+    pub fn get_uncertainty(&self) -> i64{
+        self.uncertainty
+    }
+
+
 }
 
