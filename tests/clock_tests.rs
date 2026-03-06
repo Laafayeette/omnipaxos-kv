@@ -4,7 +4,7 @@ use std::time::Duration;
 #[test]
 fn test_clock_creation() {
     println!("\n=== Testing Clock Creation ===");
-    let clock = ClockSimulator::new(50.0, 100, Duration::from_secs(60));
+    let clock = ClockSimulator::new(50.0, 100, Duration::from_secs(60)).unwrap();
     let time = clock.get_time();
     println!("Clock created successfully");
     println!("Initial time: {} microseconds", time);
@@ -17,7 +17,7 @@ fn test_clock_creation() {
 #[test]
 fn test_clock_drift() {
     println!("\n=== Testing Clock Drift ===");
-    let clock = ClockSimulator::new(50.0, 100, Duration::from_secs(60));
+    let clock = ClockSimulator::new(50.0, 100, Duration::from_secs(60)).unwrap();
     let time1 = clock.get_time();
     println!("Time 1: {} μs", time1);
 
@@ -39,7 +39,7 @@ fn test_clock_drift() {
 #[test]
 fn test_uncertainty() {
     println!("\n=== Testing Clock Uncertainty ===");
-    let clock = ClockSimulator::new(50.0, 100, Duration::from_secs(60));
+    let clock = ClockSimulator::new(50.0, 100, Duration::from_secs(60)).unwrap();
     let uncertainty = clock.get_uncertainty();
     println!("Configured uncertainty: 100 μs");
     println!("Retrieved uncertainty: {} μs", uncertainty);
@@ -52,7 +52,7 @@ fn test_all_getters() {
     println!("\n=== Testing All Getters ===");
     let drift_rate = 75.0;
     let uncertainty = 250;
-    let clock = ClockSimulator::new(drift_rate, uncertainty, Duration::from_secs(30));
+    let clock = ClockSimulator::new(drift_rate, uncertainty, Duration::from_secs(30)).unwrap();
 
     println!("Testing get_time()...");
     let time1 = clock.get_time();
@@ -75,7 +75,7 @@ fn test_all_getters() {
 #[test]
 fn test_sync_clock() {
     println!("\n=== Testing Clock Synchronization ===");
-    let mut clock = ClockSimulator::new(50.0, 100, Duration::from_secs(60));
+    let mut clock = ClockSimulator::new(50.0, 100, Duration::from_secs(60)).unwrap();
 
     println!("Initial time:");
     let time1 = clock.get_time();
