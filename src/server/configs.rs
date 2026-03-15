@@ -5,8 +5,17 @@ use omnipaxos::{
     util::{FlexibleQuorum, NodeId},
     ClusterConfig as OmnipaxosClusterConfig, OmniPaxosConfig,
     ServerConfig as OmnipaxosServerConfig,
+    clock::ClockConfig as OmnipaxosClockConfig,
 };
 use serde::{Deserialize, Serialize};
+
+fn default_clock() -> OmnipaxosClockConfig {
+    OmnipaxosClockConfig {
+        drift_us_per_s: 0.0,
+        uncertainty: 100,
+        sync_interval_ms: 1000,
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClusterConfig {
@@ -32,6 +41,8 @@ pub struct OmniPaxosKVConfig {
     pub local: LocalConfig,
     #[serde(flatten)]
     pub cluster: ClusterConfig,
+    #[serde(default = "default_clock")]
+    pub clock: OmnipaxosClockConfig,
 }
 
 impl Into<OmniPaxosConfig> for OmniPaxosKVConfig {
@@ -43,6 +54,7 @@ impl Into<OmniPaxosConfig> for OmniPaxosKVConfig {
         };
         let server_config = OmnipaxosServerConfig {
             pid: self.local.server_id,
+            clock: self.clock,
             ..Default::default()
         };
         OmniPaxosConfig {
