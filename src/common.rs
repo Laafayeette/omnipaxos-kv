@@ -3,7 +3,7 @@ pub mod messages {
     use serde::{Deserialize, Serialize};
 
     use super::{
-        kv::{Command, CommandId, KVCommand},
+        kv::{ClientId, Command, CommandId, KVCommand},
         utils::Timestamp,
     };
 
@@ -17,6 +17,15 @@ pub mod messages {
     pub enum ClusterMessage {
         OmniPaxosMessage(OmniPaxosMessage<Command>),
         LeaderStartSignal(Timestamp),
+        OWDProbe { send_time: i64, sender_uncertainty: i64 },
+        OWDFeedback { estimated_owd: i64 },
+        MulticastClientMessage {
+            client_id: ClientId,
+            message: ClientMessage,
+            deadline: i64,
+            sent_time: i64,
+            sender_uncertainty: i64,
+        },
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -43,7 +52,7 @@ pub mod messages {
 }
 
 pub mod kv {
-    use omnipaxos::{macros::Entry, storage::Snapshot};
+    use omnipaxos::storage::Snapshot;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
 
@@ -52,12 +61,22 @@ pub mod kv {
     pub type NodeId = omnipaxos::util::NodeId;
     pub type InstanceId = NodeId;
 
-    #[derive(Debug, Clone, Entry, Serialize, Deserialize)]
+    // TODO: FIX the Cargo.toml so that it calls the correct omnipaxos crate instead of the one in the parent directory
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct Command {
         pub client_id: ClientId,
         pub coordinator_id: NodeId,
         pub id: CommandId,
         pub kv_cmd: KVCommand,
+        pub deadline: i64,
+    }
+
+    impl omnipaxos::storage::Entry for Command {
+        type Snapshot = KVSnapshot;
+        fn deadline(&self) -> i64 {
+            self.deadline
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
