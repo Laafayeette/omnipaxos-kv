@@ -1,4 +1,5 @@
 use crate::{configs::OmniPaxosKVConfig, database::Database, network::Network};
+use omnipaxos_kv::clock::ClockSimulator;
 use chrono::Utc;
 use log::*;
 use omnipaxos::{
@@ -8,12 +9,28 @@ use omnipaxos::{
 };
 use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
 use omnipaxos_storage::memory_storage::MemoryStorage;
-use std::{fs::File, io::Write, time::Duration};
+use serde::Serialize;
+use std::{
+    collections::{HashMap, VecDeque},
+    fs::File,
+    io::Write,
+    time::Duration,
+};
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 const NETWORK_BATCH_SIZE: usize = 100;
 const LEADER_WAIT: Duration = Duration::from_secs(1);
 const ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
+
+const OWD_WINDOW_SIZE: usize = 20;
+const OWD_PROBE_INTERVAL: Duration = Duration::from_millis(50);
+#[allow(dead_code)]
+const OWD_BETA: f64 = 3.0;
+const OWD_D_CAP: i64 = 10_000;
+
+struct PeerOWDState {
+    window: VecDeque<i64>,
+}
 
 pub struct OmniPaxosServer {
     id: NodeId,
@@ -24,10 +41,12 @@ pub struct OmniPaxosServer {
     omnipaxos_msg_buffer: Vec<Message<Command>>,
     config: OmniPaxosKVConfig,
     peers: Vec<NodeId>,
+    clock: ClockSimulator, // global clock for OWD probing and timestamping messages
+    owd_states: HashMap<NodeId, PeerOWDState>,
 }
 
 impl OmniPaxosServer {
-    pub async fn new(config: OmniPaxosKVConfig) -> Self {
+    pub async fn new(config: OmniPaxosKVConfig, clock: ClockSimulator) -> Self {
         // Initialize OmniPaxos instance
         let storage: MemoryStorage<Command> = MemoryStorage::default();
         let omnipaxos_config: OmniPaxosConfig = config.clone().into();
@@ -35,6 +54,18 @@ impl OmniPaxosServer {
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
         // Waits for client and server network connections to be established
         let network = Network::new(config.clone(), NETWORK_BATCH_SIZE).await;
+        let peers = config.get_peers(config.local.server_id);
+        let owd_states = peers
+            .iter()
+            .map(|&p| {
+                (
+                    p,
+                    PeerOWDState {
+                        window: VecDeque::with_capacity(OWD_WINDOW_SIZE),
+                    },
+                )
+            })
+            .collect();
         OmniPaxosServer {
             id: config.local.server_id,
             database: Database::new(),
@@ -42,26 +73,34 @@ impl OmniPaxosServer {
             omnipaxos,
             current_decided_idx: 0,
             omnipaxos_msg_buffer,
-            peers: config.get_peers(config.local.server_id),
+            clock,
+            owd_states,
+            peers,
             config,
         }
     }
 
     pub async fn run(&mut self) {
-        // Save config to output file
-        self.save_output().expect("Failed to write to file");
         let mut client_msg_buf = Vec::with_capacity(NETWORK_BATCH_SIZE);
         let mut cluster_msg_buf = Vec::with_capacity(NETWORK_BATCH_SIZE);
-        // We don't use Omnipaxos leader election at first and instead force a specific initial leader
         self.establish_initial_leader(&mut cluster_msg_buf, &mut client_msg_buf)
             .await;
-        // Main event loop with leader election
         let mut election_interval = tokio::time::interval(ELECTION_TIMEOUT);
+        let mut owd_probe_interval = tokio::time::interval(OWD_PROBE_INTERVAL);
+        let mut owd_complete = false;
         loop {
             tokio::select! {
                 _ = election_interval.tick() => {
                     self.omnipaxos.tick();
                     self.send_outgoing_msgs();
+                },
+                _ = owd_probe_interval.tick(), if !owd_complete => {
+                    self.send_owd_probes();
+                    if self.owd_probing_complete() {
+                        info!("{}: OWD windows full — D={} µs, probing complete", self.id, OWD_D_CAP);
+                        self.save_output().expect("Failed to write output");
+                        owd_complete = true;
+                    }
                 },
                 _ = self.network.cluster_messages.recv_many(&mut cluster_msg_buf, NETWORK_BATCH_SIZE) => {
                     self.handle_cluster_messages(&mut cluster_msg_buf).await;
@@ -112,7 +151,6 @@ impl OmniPaxosServer {
     }
 
     fn handle_decided_entries(&mut self) {
-        // TODO: Can use a read_raw here to avoid allocation
         let new_decided_idx = self.omnipaxos.get_decided_idx();
         if self.current_decided_idx < new_decided_idx {
             let decided_entries = self
@@ -133,7 +171,6 @@ impl OmniPaxosServer {
     }
 
     fn update_database_and_respond(&mut self, commands: Vec<Command>) {
-        // TODO: batching responses possible here (batch at handle_cluster_messages)
         for command in commands {
             let read = self.database.handle_command(command.kv_cmd);
             if command.coordinator_id == self.id {
@@ -157,6 +194,7 @@ impl OmniPaxosServer {
     }
 
     async fn handle_client_messages(&mut self, messages: &mut Vec<(ClientId, ClientMessage)>) {
+        // TODO: Once the client message comes, we should multicast it to all other servers. 
         for (from, message) in messages.drain(..) {
             match message {
                 ClientMessage::Append(command_id, kv_command) => {
@@ -184,6 +222,14 @@ impl OmniPaxosServer {
                     received_start_signal = true;
                     self.send_client_start_signals(start_time);
                 }
+                ClusterMessage::OWDProbe { send_time } => {
+                    let measured_owd = self.clock.get_time() - send_time;
+                    self.network
+                        .send_to_cluster(from, ClusterMessage::OWDProbeReply { measured_owd });
+                }
+                ClusterMessage::OWDProbeReply { measured_owd } => {
+                    self.record_owd_sample(from, measured_owd);
+                }
             }
         }
         self.send_outgoing_msgs();
@@ -191,6 +237,8 @@ impl OmniPaxosServer {
     }
 
     fn append_to_log(&mut self, from: ClientId, command_id: CommandId, kv_command: KVCommand) {
+        // TODO: Handle to send the deadline and also when a server send a message to another server, it should also send the uncertainty of the message (σ_S) which is calculated by the sender's clock.
+        
         let command = Command {
             client_id: from,
             coordinator_id: self.id,
@@ -218,8 +266,91 @@ impl OmniPaxosServer {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // OWD probing
+    // -------------------------------------------------------------------------
+
+    /// Sends one OWDProbe to every peer whose window is not yet full.
+    fn send_owd_probes(&mut self) {
+        let send_time = self.clock.get_time();
+        let peers: Vec<NodeId> = self.peers.clone();
+        for peer in peers {
+            let window_full = self.owd_states
+                .get(&peer)
+                .map(|s| s.window.len() >= OWD_WINDOW_SIZE)
+                .unwrap_or(false);
+            if !window_full {
+                self.network
+                    .send_to_cluster(peer, ClusterMessage::OWDProbe { send_time });
+            }
+        }
+    }
+
+    /// Records one raw OWD sample (µs) from `peer` into the sliding window.
+    /// P (p95 of window) is recomputed on demand in estimate_owd().
+    fn record_owd_sample(&mut self, peer: NodeId, raw_owd: i64) {
+        let state = match self.owd_states.get_mut(&peer) {
+            Some(s) => s,
+            None => return,
+        };
+        if state.window.len() == OWD_WINDOW_SIZE {
+            state.window.pop_front();
+        }
+        state.window.push_back(raw_owd);
+        debug!(
+            "{}: OWD sample from peer {} = {} µs ({} in window)",
+            self.id, peer, raw_owd, state.window.len()
+        );
+    }
+
+    /// Returns true once every peer's D_cap has been refined by at least one real sample.
+    fn owd_probing_complete(&self) -> bool {
+        self.peers.iter().all(|p| {
+            self.owd_states.get(p).map(|s| s.window.len() >= OWD_WINDOW_SIZE).unwrap_or(false)
+        })
+    }
+
+ 
+    // #[allow(dead_code)]
+    // pub fn update_owd_window(&mut self, peer: NodeId, raw_owd: i64) {
+    //     if let Some(state) = self.owd_states.get_mut(&peer) {
+    //         if state.window.len() == OWD_WINDOW_SIZE {
+    //             state.window.pop_front();
+    //         }
+    //         state.window.push_back(raw_owd);
+    //     }
+    // }
+
+    // #[allow(dead_code)]
+    // pub fn estimate_owd(&self, peer: NodeId, sender_uncertainty: i64) -> i64 {
+    //     let state = match self.owd_states.get(&peer) {
+    //         Some(s) if !s.window.is_empty() => s,
+    //         _ => return OWD_D_CAP,
+    //     };
+    //     // P = p95 of whatever samples are in the window (works for any window size ≥ 1).
+    //     let mut sorted: Vec<i64> = state.window.iter().cloned().collect();
+    //     sorted.sort_unstable();
+    //     let idx = ((sorted.len() as f64 * 0.95).ceil() as usize).saturating_sub(1);
+    //     let p = sorted[idx.min(sorted.len() - 1)];
+    //     let sigma_r = self.clock.get_uncertainty();
+    //     let est = p + (OWD_BETA * ((sender_uncertainty + sigma_r) as f64)) as i64;
+    //     est.max(1).min(OWD_D_CAP)
+    // }
+
+    // ------------------Save the output ----------------------------------------------------
+
     fn save_output(&mut self) -> Result<(), std::io::Error> {
-        let config_json = serde_json::to_string_pretty(&self.config)?;
+        #[derive(Serialize)]
+        struct Output<'a> {
+            #[serde(flatten)]
+            config: &'a OmniPaxosKVConfig,
+            owd_d_cap: i64,
+        }
+        let output = Output {
+            config: &self.config,
+            owd_d_cap: OWD_D_CAP,
+        };
+        let config_json = serde_json::to_string_pretty(&output)?;
         let mut output_file = File::create(&self.config.local.output_filepath)?;
         output_file.write_all(config_json.as_bytes())?;
         output_file.flush()?;

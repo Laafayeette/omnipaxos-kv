@@ -17,6 +17,11 @@ pub mod messages {
     pub enum ClusterMessage {
         OmniPaxosMessage(OmniPaxosMessage<Command>),
         LeaderStartSignal(Timestamp),
+        /// Sent by a server to probe the one-way delay to a peer.
+        /// The receiver replies with OWDProbeReply containing the measured OWD.
+        OWDProbe { send_time: i64 },
+        /// Reply to OWDProbe: measured_owd = receiver_clock - sender send_time (µs).
+        OWDProbeReply { measured_owd: i64 },
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
