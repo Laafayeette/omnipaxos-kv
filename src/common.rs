@@ -3,7 +3,7 @@ pub mod messages {
     use serde::{Deserialize, Serialize};
 
     use super::{
-        kv::{Command, CommandId, KVCommand},
+        kv::{ClientId, Command, CommandId, KVCommand},
         utils::Timestamp,
     };
 
@@ -17,8 +17,15 @@ pub mod messages {
     pub enum ClusterMessage {
         OmniPaxosMessage(OmniPaxosMessage<Command>),
         LeaderStartSignal(Timestamp),
-        OWDProbe { send_time: i64 },
-        OWDProbeReply { measured_owd: i64 },
+        OWDProbe { send_time: i64, sender_uncertainty: i64 },
+        OWDFeedback { estimated_owd: i64 },
+        MulticastClientMessage {
+            client_id: ClientId,
+            message: ClientMessage,
+            deadline: i64,
+            sent_time: i64,
+            sender_uncertainty: i64,
+        },
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -60,6 +67,7 @@ pub mod kv {
         pub coordinator_id: NodeId,
         pub id: CommandId,
         pub kv_cmd: KVCommand,
+        pub deadline: i64,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
