@@ -41,7 +41,7 @@ pub struct OmniPaxosServer {
     omnipaxos_msg_buffer: Vec<Message<Command>>,
     config: OmniPaxosKVConfig,
     peers: Vec<NodeId>,
-    clock: ClockSimulator, // global clock for OWD probing and timestamping messages
+    clock: ClockSimulator,
     owd_states: HashMap<NodeId, PeerOWDState>,
 }
 
@@ -341,14 +341,45 @@ impl OmniPaxosServer {
 
     fn save_output(&mut self) -> Result<(), std::io::Error> {
         #[derive(Serialize)]
+        struct PeerOWDOutput {
+            peer: NodeId,
+            samples_us: Vec<i64>,
+            p95_us: i64,
+        }
+        #[derive(Serialize)]
         struct Output<'a> {
             #[serde(flatten)]
             config: &'a OmniPaxosKVConfig,
             owd_d_cap: i64,
+            owd_windows: Vec<PeerOWDOutput>,
         }
+
+        let owd_windows: Vec<PeerOWDOutput> = {
+            let mut entries: Vec<_> = self.owd_states.iter().collect();
+            entries.sort_by_key(|(id, _)| *id);
+            entries
+                .into_iter()
+                .map(|(peer, state)| {
+                    let samples_us: Vec<i64> = state.window.iter().cloned().collect();
+                    let p95_us = if samples_us.is_empty() {
+                        OWD_D_CAP
+                    } else {
+                        let mut sorted = samples_us.clone();
+                        sorted.sort_unstable();
+                        let idx = ((sorted.len() as f64 * 0.95).ceil() as usize)
+                            .saturating_sub(1)
+                            .min(sorted.len() - 1);
+                        sorted[idx]
+                    };
+                    PeerOWDOutput { peer: *peer, samples_us, p95_us }
+                })
+                .collect()
+        };
+
         let output = Output {
             config: &self.config,
             owd_d_cap: OWD_D_CAP,
+            owd_windows,
         };
         let config_json = serde_json::to_string_pretty(&output)?;
         let mut output_file = File::create(&self.config.local.output_filepath)?;
