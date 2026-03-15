@@ -9,6 +9,8 @@ use omnipaxos::{
 use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
 use omnipaxos_storage::memory_storage::MemoryStorage;
 use std::{fs::File, io::Write, time::Duration};
+use std::pin::Pin;
+use tokio::time::{sleep, Instant, Sleep};
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 const NETWORK_BATCH_SIZE: usize = 100;
@@ -24,6 +26,9 @@ pub struct OmniPaxosServer {
     omnipaxos_msg_buffer: Vec<Message<Command>>,
     config: OmniPaxosKVConfig,
     peers: Vec<NodeId>,
+
+    early_buffer_sleep: Pin<Box<Sleep>>,
+    early_buffer_timer_armed: bool,
 }
 
 impl OmniPaxosServer {
@@ -44,6 +49,9 @@ impl OmniPaxosServer {
             omnipaxos_msg_buffer,
             peers: config.get_peers(config.local.server_id),
             config,
+
+            early_buffer_sleep: Box::pin(sleep(Duration::from_secs(24 * 60 * 60 * 365))),
+            early_buffer_timer_armed: false,
         }
     }
 
@@ -68,6 +76,12 @@ impl OmniPaxosServer {
                 },
                 _ = self.network.client_messages.recv_many(&mut client_msg_buf, NETWORK_BATCH_SIZE) => {
                     self.handle_client_messages(&mut client_msg_buf).await;
+                },
+
+                _ = &mut self.early_buffer_sleep, if self.early_buffer_timer_armed => {
+                self.omnipaxos.process_early_buffer();
+                self.reset_early_buffer_timer();
+                self.send_outgoing_msgs();
                 },
             }
         }
@@ -107,6 +121,22 @@ impl OmniPaxosServer {
                 _ = self.network.client_messages.recv_many(client_msg_buffer, NETWORK_BATCH_SIZE) => {
                     self.handle_client_messages(client_msg_buffer).await;
                 },
+            }
+        }
+    }
+
+    fn reset_early_buffer_timer(&mut self) {
+        match self.omnipaxos.time_until_next_early_buffer_deadline() {
+            Some(wait_us) => {
+                let wait = Duration::from_micros(wait_us.max(0) as u64);
+                let when = Instant::now() + wait;
+                self.early_buffer_sleep.as_mut().reset(when); // Timer is ready when 'when' is reached.
+                self.early_buffer_timer_armed = true;
+            }
+            None => {
+                let disarm_when = Instant::now() + Duration::from_secs(24 * 60 * 60 * 365); // Safe 'when' at 1 year.
+                self.early_buffer_sleep.as_mut().reset(disarm_when);
+                self.early_buffer_timer_armed = false;
             }
         }
     }
@@ -160,7 +190,8 @@ impl OmniPaxosServer {
         for (from, message) in messages.drain(..) {
             match message {
                 ClientMessage::Append(command_id, kv_command) => {
-                    self.append_to_log(from, command_id, kv_command)
+                    self.append_to_log(from, command_id, kv_command);
+                    self.reset_early_buffer_timer();
                 }
             }
         }
@@ -178,6 +209,7 @@ impl OmniPaxosServer {
                 ClusterMessage::OmniPaxosMessage(m) => {
                     self.omnipaxos.handle_incoming(m);
                     self.handle_decided_entries();
+                    self.reset_early_buffer_timer();
                 }
                 ClusterMessage::LeaderStartSignal(start_time) => {
                     debug!("Received start message from peer {from}");
