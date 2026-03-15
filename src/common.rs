@@ -61,6 +61,8 @@ pub mod kv {
     pub type NodeId = omnipaxos::util::NodeId;
     pub type InstanceId = NodeId;
 
+    // TODO: FIX the Cargo.toml so that it calls the correct omnipaxos crate instead of the one in the parent directory
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct Command {
         pub client_id: ClientId,
