@@ -251,12 +251,13 @@ impl OmniPaxosServer {
                     deadline,
                     sent_time: send_time,
                     sender_uncertainty: sigma_s,
+                    coordinator_id: self.id,
                 });
             }
             // Append to local OmniPaxos log
             match message {
                 ClientMessage::Append(command_id, kv_command) => {
-                    self.append_to_log(from, command_id, kv_command, deadline);
+                    self.append_to_log(from, command_id, kv_command, deadline, self.id);
                     self.reset_early_buffer_timer();
                 }
             }
@@ -294,7 +295,7 @@ impl OmniPaxosServer {
                     // Sender stores the latest estimate returned by peer 'from'.
                     self.deadline_send_array.insert(from, estimated_owd);
                 }
-                ClusterMessage::MulticastClientMessage { client_id, message, deadline, sent_time, sender_uncertainty } => {
+                ClusterMessage::MulticastClientMessage { client_id, message, deadline, sent_time, sender_uncertainty, coordinator_id } => {
                     // Receiver: update sliding window, adapt D_cap, compute estimate, send feedback.
                     // This is for SUBSEQUENT deadlines, current request proceeds immediately.
                     let raw_owd = self.clock.get_time() - sent_time;
@@ -305,7 +306,7 @@ impl OmniPaxosServer {
                     debug!("{}: Received multicast from {} deadline={} µs raw_owd={} µs", self.id, from, deadline, raw_owd);
                     match message {
                         ClientMessage::Append(command_id, kv_command) => {
-                            self.append_to_log(client_id, command_id, kv_command, deadline);
+                            self.append_to_log(client_id, command_id, kv_command, deadline, coordinator_id);
                         }
                     }
                 }
@@ -315,11 +316,11 @@ impl OmniPaxosServer {
         received_start_signal
     }
 
-    fn append_to_log(&mut self, from: ClientId, command_id: CommandId, kv_command: KVCommand, deadline : i64) {
+    fn append_to_log(&mut self, from: ClientId, command_id: CommandId, kv_command: KVCommand, deadline : i64, coordinator_id: NodeId) {
         
         let command = Command {
             client_id: from,
-            coordinator_id: self.id,
+            coordinator_id: coordinator_id,
             id: command_id,
             kv_cmd: kv_command,
             deadline: deadline,

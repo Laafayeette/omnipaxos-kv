@@ -25,6 +25,7 @@ pub mod messages {
             deadline: i64,
             sent_time: i64,
             sender_uncertainty: i64,
+            coordinator_id: NodeId,
         },
     }
 
