@@ -52,7 +52,7 @@ pub mod messages {
 }
 
 pub mod kv {
-    use omnipaxos::{macros::Entry, storage::Snapshot};
+    use omnipaxos::storage::Snapshot;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
 
@@ -61,13 +61,20 @@ pub mod kv {
     pub type NodeId = omnipaxos::util::NodeId;
     pub type InstanceId = NodeId;
 
-    #[derive(Debug, Clone, Entry, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct Command {
         pub client_id: ClientId,
         pub coordinator_id: NodeId,
         pub id: CommandId,
         pub kv_cmd: KVCommand,
         pub deadline: i64,
+    }
+
+    impl omnipaxos::storage::Entry for Command {
+        type Snapshot = KVSnapshot;
+        fn deadline(&self) -> i64 {
+            self.deadline
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
