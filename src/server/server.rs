@@ -100,12 +100,17 @@ impl OmniPaxosServer {
             .await;
         let mut election_interval = tokio::time::interval(ELECTION_TIMEOUT);
         let mut owd_probe_interval = tokio::time::interval(OWD_PROBE_INTERVAL);
+        let sync_interval_ms = self.config.clock.sync_interval_ms;
+        let mut clock_sync_interval = tokio::time::interval(Duration::from_millis(sync_interval_ms));
         let mut owd_complete = false;
         loop {
             tokio::select! {
                 _ = election_interval.tick() => {
                     self.omnipaxos.tick();
                     self.send_outgoing_msgs();
+                },
+                _ = clock_sync_interval.tick() => {
+                    self.omnipaxos.sync_clock();
                 },
                 _ = owd_probe_interval.tick(), if !owd_complete => {
                     self.send_owd_probes();
