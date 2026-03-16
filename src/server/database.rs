@@ -23,4 +23,15 @@ impl Database {
             KVCommand::Get(key) => Some(self.db.get(&key).map(|v| v.clone())),
         }
     }
+
+    pub fn state(&self) -> &HashMap<String, String> {
+        &self.db
+    }
+
+    pub fn read_only_result(&self, command: &KVCommand) -> Option<Option<String>> {
+        match command {
+            KVCommand::Put(_, _) | KVCommand::Delete(_) => None,
+            KVCommand::Get(key) => Some(self.db.get(key).cloned()),
+        }
+    }
 }

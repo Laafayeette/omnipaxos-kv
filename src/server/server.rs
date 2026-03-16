@@ -2,13 +2,14 @@ use crate::{configs::OmniPaxosKVConfig, database::Database, network::Network};
 use chrono::Utc;
 use log::*;
 use omnipaxos::{OmniPaxos, OmniPaxosConfig, messages::Message, util::{LogEntry, NodeId}, ProcessEarlyBufferResult, FastHash, ReleasedEntry};
-use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
+use omnipaxos_kv::common::{kv::{self, *}, messages::*, utils::Timestamp};
 use omnipaxos_storage::memory_storage::MemoryStorage;
 use std::pin::Pin;
 use tokio::time::{sleep, Instant, Sleep};
+use tokio::signal::unix::{signal, SignalKind};
 use serde::Serialize;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs::File,
     io::Write,
     time::Duration,
@@ -42,6 +43,7 @@ struct QuorumRecord {
     epoch: Option<Ballot>,
     leader_reply: Option<LeaderReplyRecord>,
     follower_hashes: HashMap<NodeId, FastHash>,
+    slow_reply_nodes: HashSet<NodeId>,
     proxy_has_completed: bool,
 }
 
@@ -62,6 +64,8 @@ pub struct OmniPaxosServer {
     // Sender-owned latest estimate returned by each peer's receiver
     deadline_send_array: HashMap<NodeId, i64>,
     quorum_records: HashMap<(ClientId, CommandId), QuorumRecord>,
+    fast_path_count: usize,
+    slow_path_count: usize,
 }
 
 impl OmniPaxosServer {
@@ -103,6 +107,8 @@ impl OmniPaxosServer {
             early_buffer_sleep: Box::pin(sleep(Duration::from_secs(24 * 60 * 60 * 365))),
             early_buffer_timer_armed: false,
             quorum_records: Default::default(),
+            fast_path_count: 0,
+            slow_path_count: 0,
         }
     }
 
@@ -116,10 +122,29 @@ impl OmniPaxosServer {
         let sync_interval_ms = self.config.clock.sync_interval_ms;
         let mut clock_sync_interval = tokio::time::interval(Duration::from_millis(sync_interval_ms));
         let mut owd_complete = false;
+        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        let mut sigint  = signal(SignalKind::interrupt()).expect("SIGINT handler");
         loop {
             tokio::select! {
+                _ = sigterm.recv() => {
+                    info!("{}: SIGTERM — saving final output", self.id);
+                    self.save_output().expect("Failed to write output on SIGTERM");
+                    return;
+                },
+                _ = sigint.recv() => {
+                    info!("{}: SIGINT — saving final output", self.id);
+                    self.save_output().expect("Failed to write output on SIGINT");
+                    return;
+                },
                 _ = election_interval.tick() => {
                     self.omnipaxos.tick();
+                    if self.omnipaxos.get_current_leader()
+                        .map(|(id, ready)| id == self.id && ready)
+                        .unwrap_or(false)
+                    {
+                        self.omnipaxos.process_late_buffer();
+                        self.reset_early_buffer_timer();
+                    }
                     self.send_outgoing_msgs();
                 },
                 _ = clock_sync_interval.tick() => {
@@ -214,12 +239,11 @@ impl OmniPaxosServer {
                     self.omnipaxos.append_synced_log(cmd_for_synced_log, result.clone());
                     let hash = self.omnipaxos.hash_synced_log();
 
-                    // For log modification
                     let synced_log_id = cmd.log_id;
                     let synced_deadline = cmd.entry.deadline;
                     let command_id = cmd.entry.id.clone();
                     let client_id = cmd.entry.client_id.clone();
-                    self.broadcast_log_modification(epoch, client_id, command_id, synced_deadline, synced_log_id);
+                    self.broadcast_log_modification(epoch, client_id, command_id, synced_deadline, synced_log_id, coordinator_id);
 
 
                     // Broadcast log modification?
@@ -311,11 +335,23 @@ impl OmniPaxosServer {
         for command in commands {
             let read = self.database.handle_command(command.kv_cmd);
             if command.coordinator_id == self.id {
-                let response = match read {
-                    Some(read_result) => ServerMessage::Read(command.id, read_result),
-                    None => ServerMessage::Write(command.id),
-                };
-                self.network.send_to_client(command.client_id, response);
+                let key = (command.client_id, command.id);
+                // Skip if fast/slow path already sent a reply for this request.
+                let already_replied = self.quorum_records
+                    .get(&key)
+                    .map(|r| r.proxy_has_completed)
+                    .unwrap_or(false);
+                if !already_replied {
+                    let response = match read {
+                        Some(read_result) => ServerMessage::Read(command.id, read_result),
+                        None => ServerMessage::Write(command.id),
+                    };
+                    self.network.send_to_client(command.client_id, response);
+                }
+                // Mark completed so any belated fast/slow path reply is suppressed too.
+                if let Some(record) = self.quorum_records.get_mut(&key) {
+                    record.proxy_has_completed = true;
+                }
             }
         }
     }
@@ -323,10 +359,19 @@ impl OmniPaxosServer {
     fn send_outgoing_msgs(&mut self) {
         self.omnipaxos
             .take_outgoing_messages(&mut self.omnipaxos_msg_buffer);
+        let mut loopback: Vec<_> = Vec::new();
         for msg in self.omnipaxos_msg_buffer.drain(..) {
             let to = msg.get_receiver();
-            let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
-            self.network.send_to_cluster(to, cluster_msg);
+            if to == self.id {
+                // Self-addressed messages (e.g., BLE self-vote) must be fed back locally.
+                loopback.push(msg);
+            } else {
+                let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
+                self.network.send_to_cluster(to, cluster_msg);
+            }
+        }
+        for msg in loopback {
+            self.omnipaxos.handle_incoming(msg);
         }
     }
 
@@ -364,6 +409,7 @@ impl OmniPaxosServer {
                             epoch: None,
                             leader_reply: None,
                             follower_hashes: HashMap::new(),
+                            slow_reply_nodes: HashSet::new(),
                             proxy_has_completed: false,
                         },
                     );
@@ -446,6 +492,9 @@ impl OmniPaxosServer {
                     proxy_id,
                 } => {
                     self.handle_log_modification(epoch, client_id, command_id, deadline, log_id, proxy_id);
+                }
+                ClusterMessage::SlowReply { from, client_id, command_id, epoch } => {
+                    self.handle_slow_reply(from, client_id, command_id, epoch);
                 }
             }
         }
@@ -568,11 +617,20 @@ impl OmniPaxosServer {
             p95_us: i64,
         }
         #[derive(Serialize)]
+        struct SyncedEntry<'a> {
+            request: &'a kv::KVCommand,
+            result: &'a Option<Option<String>>,
+        }
+        #[derive(Serialize)]
         struct Output<'a> {
             #[serde(flatten)]
             config: &'a OmniPaxosKVConfig,
             owd_d_cap: i64,
             owd_windows: Vec<PeerOWDOutput>,
+            fast_path_count: usize,
+            slow_path_count: usize,
+            synced_log_len: usize,
+            synced_log: Vec<SyncedEntry<'a>>,
         }
 
         let owd_windows: Vec<PeerOWDOutput> = {
@@ -597,10 +655,20 @@ impl OmniPaxosServer {
                 .collect()
         };
 
+        let raw_synced = self.omnipaxos.get_synced_log();
+        let synced_log: Vec<SyncedEntry> = raw_synced
+            .iter()
+            .map(|(cmd, result)| SyncedEntry { request: &cmd.kv_cmd, result })
+            .collect();
+
         let output = Output {
             config: &self.config,
             owd_d_cap: OWD_D_CAP,
             owd_windows,
+            fast_path_count: self.fast_path_count,
+            slow_path_count: self.slow_path_count,
+            synced_log_len: synced_log.len(),
+            synced_log,
         };
         let config_json = serde_json::to_string_pretty(&output)?;
         let mut output_file = File::create(&self.config.local.output_filepath)?;
@@ -609,13 +677,12 @@ impl OmniPaxosServer {
         Ok(())
     }
 
-    fn execute_on_state_machine(&mut self, command: &Command) -> Option<Option<String>> {
-        self.database.handle_command(command.kv_cmd.clone())
+    fn execute_on_state_machine(&self, command: &Command) -> Option<Option<String>> {
+        self.database.read_only_result(&command.kv_cmd)
     }
 
-    fn broadcast_log_modification(&mut self, epoch: Ballot, client_id: ClientId, command_id: CommandId, deadline: i64, log_id: usize) {
+    fn broadcast_log_modification(&mut self, epoch: Ballot, client_id: ClientId, command_id: CommandId, deadline: i64, log_id: usize, proxy_id: NodeId) {
         let peers: Vec<NodeId> = self.peers.clone();
-        let proxy_id: NodeId = self.id;
         for peer in peers {
             self.network.send_to_cluster(
                 peer,
@@ -685,6 +752,7 @@ impl OmniPaxosServer {
                 record.epoch = Some(epoch);
                 record.leader_reply = None;
                 record.follower_hashes.clear();
+                record.slow_reply_nodes.clear();
             }
             Some(_) => {}
         }
@@ -724,6 +792,16 @@ impl OmniPaxosServer {
         self.try_complete_fast_path(client_id, command_id);
     }
 
+    fn handle_slow_reply(&mut self, from: NodeId, client_id: ClientId, command_id: CommandId, epoch: Ballot) {
+        let key = (client_id, command_id);
+        let Some(record) = self.quorum_records.get_mut(&key) else { return; };
+        if record.proxy_has_completed { return; }
+        if Self::check_if_stale_epoch(epoch, record) { return; }
+        // HashSet insert is idempotent — duplicate slow-replies are silently ignored
+        record.slow_reply_nodes.insert(from);
+        self.try_complete_fast_path(client_id, command_id);
+    }
+
     fn try_complete_fast_path(&mut self, client_id: ClientId, command_id: CommandId) {
         let key = (client_id, command_id);
 
@@ -740,28 +818,31 @@ impl OmniPaxosServer {
                 return;
             };
 
-            // Count amount of matching hashes from leader with followers.
-            let matching_follower_count = record
-                .follower_hashes
-                .values()
-                .filter(|hash| **hash == leader_reply.hash)
-                .count();
-
-            // Nezha fast quorum for n = 2f + 1 replicas:
-            // fast_quorum = f + floor(f / 2) + 1
-            let n = self.peers.len() + 1; // peers + self
+            let n = self.peers.len() + 1;
             let f = (n - 1) / 2;
+
+            let fast_only_count = record
+                .follower_hashes
+                .iter()
+                .filter(|(node_id, hash)| {
+                    !record.slow_reply_nodes.contains(*node_id)
+                        && **hash == leader_reply.hash
+                })
+                .count();
+            let slow_count = record.slow_reply_nodes.len();
+            let total_fast = 1 + fast_only_count + slow_count;
             let fast_quorum = f + f.div_ceil(2) + 1;
 
-            let total_matching = 1 + matching_follower_count;  // include leader's hash
-
-            if total_matching < fast_quorum {
-                return;
+            if total_fast >= fast_quorum {
+                Some((Self::response_from_exec_result(command_id, leader_reply), true))
+            } else if f > 0 && slow_count >= f {
+                Some((Self::response_from_exec_result(command_id, leader_reply), false))
+            } else {
+                None
             }
-
-            // Evaluate the leader's execution result as the response at row 698
-            Self::response_from_exec_result(command_id, leader_reply)
         };
+
+        let Some((response, via_fast_path)) = response else { return; };
 
         let Some(record) = self.quorum_records.get_mut(&key) else {
             return;
@@ -772,6 +853,11 @@ impl OmniPaxosServer {
         }
 
         record.proxy_has_completed = true;
+        if via_fast_path {
+            self.fast_path_count += 1;
+        } else {
+            self.slow_path_count += 1;
+        }
         self.network.send_to_client(client_id, response);
     }
 
@@ -790,7 +876,22 @@ impl OmniPaxosServer {
         self.handle_follower_fast_reply(self.id, entry.entry.id, entry.entry.client_id, epoch, entry.hash.expect("Local follower fast reply missing hash")) // Followers always have hash
     }
 
-    fn handle_log_modification(&self, epoch: Ballot, client_id: ClientId, command_id: CommandId, deadline: i64, log_id: usize, proxy_id: NodeId) {
-       //self.omnipaxos.handle_log_modification(epoch, client_id, command_id, deadline, log_id, proxy_id);
+    fn handle_log_modification(&mut self, epoch: Ballot, client_id: ClientId, command_id: CommandId, deadline: i64, log_id: usize, proxy_id: NodeId) {
+        if let Some(_appended_log_id) = self.omnipaxos.handle_log_modification(client_id, command_id, deadline, log_id) {
+            self.reset_early_buffer_timer();
+            if proxy_id == self.id {
+                self.handle_slow_reply(self.id, client_id, command_id, epoch);
+            } else {
+                self.network.send_to_cluster(
+                    proxy_id,
+                    ClusterMessage::SlowReply {
+                        from: self.id,
+                        client_id,
+                        command_id,
+                        epoch,
+                    },
+                );
+            }
+        }
     }
 }

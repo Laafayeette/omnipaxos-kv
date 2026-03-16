@@ -131,11 +131,10 @@ impl Client {
 
     fn run_finished(&self) -> bool {
         if let Some(count) = self.final_request_count {
-            if self.client_data.request_count() >= count {
-                return true;
-            }
+            self.client_data.response_count() >= count
+        } else {
+            false
         }
-        return false;
     }
 
     // Wait until the scheduled start time to synchronize client starts.
