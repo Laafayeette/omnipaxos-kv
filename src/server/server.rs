@@ -2,6 +2,7 @@ use crate::{configs::OmniPaxosKVConfig, database::Database, network::Network};
 use chrono::Utc;
 use log::*;
 use omnipaxos::{OmniPaxos, OmniPaxosConfig, messages::Message, util::{LogEntry, NodeId}, ProcessEarlyBufferResult};
+use omnipaxos::{OmniPaxos, OmniPaxosConfig, messages::Message, util::{LogEntry, NodeId}, ProcessEarlyBufferResult, FastHash};
 use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
 use omnipaxos_storage::memory_storage::MemoryStorage;
 use std::pin::Pin;
@@ -29,6 +30,22 @@ struct PeerOWDState {
     window: VecDeque<i64>,
 }
 
+#[derive(Debug, Clone)]
+struct LeaderReplyRecord {
+    from: NodeId,
+    epoch: Ballot,
+    result: Option<Option<String>>,
+    hash: FastHash,
+}
+
+#[derive(Debug, Clone)]
+struct QuorumRecord {
+    epoch: Option<Ballot>,
+    leader_reply: Option<LeaderReplyRecord>,
+    follower_hashes: HashMap<NodeId, FastHash>,
+    proxy_has_completed: bool,
+}
+
 pub struct OmniPaxosServer {
     id: NodeId,
     database: Database,
@@ -45,6 +62,7 @@ pub struct OmniPaxosServer {
     owd_states: HashMap<NodeId, PeerOWDState>,
     // Sender-owned latest estimate returned by each peer's receiver
     deadline_send_array: HashMap<NodeId, i64>,
+    quorum_records: HashMap<(ClientId, CommandId), QuorumRecord>,
 }
 
 impl OmniPaxosServer {
@@ -85,6 +103,7 @@ impl OmniPaxosServer {
 
             early_buffer_sleep: Box::pin(sleep(Duration::from_secs(24 * 60 * 60 * 365))),
             early_buffer_timer_armed: false,
+            quorum_records: Default::default(),
         }
     }
 
@@ -332,6 +351,15 @@ impl OmniPaxosServer {
             // Append to local OmniPaxos log
             match message {
                 ClientMessage::Append(command_id, kv_command) => {
+                    self.quorum_records.insert(
+                        (from, command_id),
+                        QuorumRecord {
+                            epoch: None,
+                            leader_reply: None,
+                            follower_hashes: HashMap::new(),
+                            proxy_has_completed: false,
+                        },
+                    );
                     self.append_to_log(from, command_id, kv_command, deadline, self.id);
                     self.reset_early_buffer_timer();
                 }
@@ -386,6 +414,7 @@ impl OmniPaxosServer {
                 }
                 ClusterMessage::FollowerFastReply { from, command_id, client_id, epoch, hash
                 } => {
+                    self.handle_follower_fast_reply(from, command_id, client_id, epoch, hash);
 
                 }
                 ClusterMessage::LeaderFastReply {
@@ -393,10 +422,14 @@ impl OmniPaxosServer {
                     command_id,
                     client_id,
                     epoch,
-                    result, hash,
+                    result,
+                    hash,
                 } => {
-
+                    self.handle_leader_fast_reply(from, command_id, client_id, epoch, result, hash)
                 }
+                /**ClusterMessage::LogModification {
+                    // self.omnipaxos.syncModified(cmd);
+                }*/
             }
         }
         self.send_outgoing_msgs();
@@ -565,5 +598,103 @@ impl OmniPaxosServer {
 
     fn broadcast_log_modification(&self) {
         todo!()
+    }
+
+    fn handle_leader_fast_reply(
+        &mut self,
+        node_id: NodeId,
+        command_id: CommandId,
+        client_id: ClientId,
+        epoch: Ballot,
+        result: Option<Option<String>>, hash: FastHash)
+    {
+        let key = (client_id, command_id);
+
+        let Some(record) =
+            self.quorum_records.get_mut(&key)
+        else {
+            return;
+        };
+
+        // If request already has been completed (committed) by this proxy before
+        if record.proxy_has_completed {
+            return;
+        }
+
+        if Self::check_if_stale_epoch(epoch, record) { return; }
+
+        // If there is an existing recorded leader reply and it is duplicate then return.
+        if let Some(recorded_leader_reply) = &record.leader_reply {
+            if recorded_leader_reply.from == node_id && recorded_leader_reply.epoch == epoch {
+                return;
+            }
+        }
+
+        record.leader_reply = Some(LeaderReplyRecord {
+            from: node_id,
+            epoch,
+            result,
+            hash,
+        });
+
+        self.try_complete_fast_path(client_id, command_id);
+
+    }
+
+    fn check_if_stale_epoch(epoch: Ballot, record: &mut QuorumRecord) -> bool {
+        match record.epoch {
+            None => {
+                record.epoch = Some(epoch); // First epoch of this request
+            }
+            Some(epoch_in_record) if epoch < epoch_in_record => {
+                return true; // stale reply
+            }
+            Some(epoch_in_record) if epoch > epoch_in_record => {
+                // newer epoch replaces old reply set
+                record.epoch = Some(epoch);
+                record.leader_reply = None;
+                record.follower_hashes.clear();
+            }
+            Some(_) => {}
+        }
+        false
+    }
+
+    fn handle_follower_fast_reply(
+        &mut self,
+        node_id: NodeId,
+        command_id: CommandId,
+        client_id: ClientId,
+        epoch: Ballot,
+        hash: FastHash,
+    ) {
+        let key = (client_id, command_id);
+
+        let Some(record) = self.quorum_records.get_mut(&key) else {
+            return;
+        };
+
+        // Already completed by this proxy
+        if record.proxy_has_completed {
+            return;
+        }
+
+        if Self::check_if_stale_epoch(epoch, record) { return; }
+
+        // Duplicate follower reply from same node in same epoch
+        if record.follower_hashes.contains_key(&node_id) {
+            return;
+        }
+
+        // All good, store follower's hash
+        record.follower_hashes.insert(node_id, hash);
+
+        // Try checking for fast-path quorum
+        self.try_complete_fast_path(client_id, command_id);
+    }
+
+    fn try_complete_fast_path(&mut self, client_id: ClientId, command_id: CommandId) {
+
+
     }
 }
