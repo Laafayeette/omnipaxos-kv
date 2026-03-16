@@ -1,5 +1,6 @@
 pub mod messages {
-    use omnipaxos::{messages::Message as OmniPaxosMessage, util::NodeId};
+    use omnipaxos::{messages::Message as OmniPaxosMessage, util::NodeId, FastHash};
+    use omnipaxos::ballot_leader_election::Ballot;
     use serde::{Deserialize, Serialize};
 
     use super::{
@@ -26,6 +27,21 @@ pub mod messages {
             sent_time: i64,
             sender_uncertainty: i64,
             coordinator_id: NodeId,
+        },
+        LeaderFastReply {
+            from: NodeId,
+            command_id: CommandId,
+            client_id: ClientId,
+            epoch: Ballot,
+            result: Option<Option<String>>,
+            hash: FastHash,
+        },
+        FollowerFastReply {
+            from: NodeId,
+            command_id: CommandId,
+            client_id: ClientId,
+            epoch: Ballot,
+            hash: FastHash
         },
     }
 

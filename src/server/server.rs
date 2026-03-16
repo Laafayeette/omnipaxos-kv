@@ -1,9 +1,7 @@
 use crate::{configs::OmniPaxosKVConfig, database::Database, network::Network};
 use chrono::Utc;
 use log::*;
-use omnipaxos::{
-    OmniPaxos, OmniPaxosConfig, messages::Message, util::{LogEntry, NodeId}
-};
+use omnipaxos::{OmniPaxos, OmniPaxosConfig, messages::Message, util::{LogEntry, NodeId}, ProcessEarlyBufferResult};
 use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
 use omnipaxos_storage::memory_storage::MemoryStorage;
 use std::pin::Pin;
@@ -15,6 +13,7 @@ use std::{
     io::Write,
     time::Duration,
 };
+use omnipaxos::ballot_leader_election::Ballot;
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 const NETWORK_BATCH_SIZE: usize = 100;
@@ -124,7 +123,8 @@ impl OmniPaxosServer {
                 },
 
                 _ = &mut self.early_buffer_sleep, if self.early_buffer_timer_armed => {
-                self.omnipaxos.process_early_buffer();
+                let released_buffer = self.omnipaxos.process_early_buffer();
+                self.handle_released_entries(released_buffer);
                 self.reset_early_buffer_timer();
                 self.send_outgoing_msgs();
                 },
@@ -166,6 +166,81 @@ impl OmniPaxosServer {
                 _ = self.network.client_messages.recv_many(client_msg_buffer, NETWORK_BATCH_SIZE) => {
                     self.handle_client_messages(client_msg_buffer).await;
                 },
+            }
+        }
+    }
+
+    fn handle_released_entries(&mut self, released_buffer: ProcessEarlyBufferResult<Command>) {
+        let ProcessEarlyBufferResult {
+            released_entries,
+            leader_exec_epoch,
+            reply_epoch,
+        } = released_buffer;
+
+        match leader_exec_epoch {
+            // I am leader for these popped entries, then I must execute, append to synced_log, and hash.
+            Some(epoch) => {
+                for cmd in released_entries {
+                    let result = self.execute_on_state_machine(&cmd.entry);
+                    let coordinator_id = cmd.entry.coordinator_id;
+                    let command_id = cmd.entry.id;
+                    let client_id = cmd.entry.client_id;
+
+                    // synced-log.append({𝑟𝑒𝑞𝑢𝑒𝑠𝑡,𝑟𝑒𝑠𝑢𝑙𝑡})
+                    let cmd_for_synced_log = omnipaxos::ReleasedEntry {
+                        entry: cmd.entry.clone(),
+                        log_id: cmd.log_id,
+                        hash: cmd.hash.clone(),
+                    };
+                    self.omnipaxos.append_synced_log(cmd_for_synced_log, result.clone());
+                    let hash = self.omnipaxos.hash_synced_log();
+
+
+                    // Broadcast log modification?
+                    //self.append_log_modification_entry(ersu)
+                    //self.broadcast_log_modification();
+
+                    if coordinator_id == self.id { // If I am proxy for this message.
+                        self.handle_local_leader_execution_reply(cmd, epoch, result);
+                    }
+                    else {
+                        self.network.send_to_cluster( // Send ack back to proxy with result.
+                            coordinator_id,
+                            ClusterMessage::LeaderFastReply {
+                                from: self.id,
+                                command_id,
+                                client_id,
+                                epoch,
+                                result,
+                                hash,
+                            },
+                        );
+                    }
+                }
+            }
+            None => { // I am follower for these popped entries.
+                for cmd in released_entries {
+                    // I am follower
+                    let coordinator_id = cmd.entry.coordinator_id;
+                    let command_id = cmd.entry.id;
+                    let client_id = cmd.entry.client_id;
+                    let hash = cmd.hash;
+
+                    if coordinator_id == self.id { // If I am proxy for this message.
+                        self.handle_local_follower_fast_reply(cmd);
+                    } else {
+                        self.network.send_to_cluster(
+                            coordinator_id,
+                            ClusterMessage::FollowerFastReply {
+                                from: self.id,
+                                command_id,
+                                client_id,
+                                epoch: reply_epoch,
+                                hash: hash.expect("Hash could not be extracted"),
+                            },
+                        );
+                    }
+                }
             }
         }
     }
@@ -305,8 +380,22 @@ impl OmniPaxosServer {
                     match message {
                         ClientMessage::Append(command_id, kv_command) => {
                             self.append_to_log(client_id, command_id, kv_command, deadline, coordinator_id);
+                            self.reset_early_buffer_timer();
                         }
                     }
+                }
+                ClusterMessage::FollowerFastReply { from, command_id, client_id, epoch, hash
+                } => {
+
+                }
+                ClusterMessage::LeaderFastReply {
+                    from,
+                    command_id,
+                    client_id,
+                    epoch,
+                    result, hash,
+                } => {
+
                 }
             }
         }
@@ -323,9 +412,7 @@ impl OmniPaxosServer {
             kv_cmd: kv_command,
             deadline: deadline,
         };
-        self.omnipaxos
-            .append(command)
-            .expect("Append to Omnipaxos log failed");
+        self.omnipaxos.append_nezha(command).expect("Nezha append failed failed.")
     }
 
     fn send_cluster_start_signals(&mut self, start_time: Timestamp) {
@@ -470,5 +557,13 @@ impl OmniPaxosServer {
         output_file.write_all(config_json.as_bytes())?;
         output_file.flush()?;
         Ok(())
+    }
+
+    fn execute_on_state_machine(&mut self, command: &Command) -> Option<Option<String>> {
+        self.database.handle_command(command.kv_cmd.clone())
+    }
+
+    fn broadcast_log_modification(&self) {
+        todo!()
     }
 }
