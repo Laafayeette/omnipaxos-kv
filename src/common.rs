@@ -43,6 +43,14 @@ pub mod messages {
             epoch: Ballot,
             hash: FastHash
         },
+        LogModification {
+            epoch: Ballot,
+            client_id: ClientId,
+            command_id: CommandId,
+            deadline: i64,
+            log_id: usize,
+            proxy_id: NodeId,
+        },
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]

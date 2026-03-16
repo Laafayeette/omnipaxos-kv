@@ -206,13 +206,20 @@ impl OmniPaxosServer {
                     let client_id = cmd.entry.client_id;
 
                     // synced-log.append({𝑟𝑒𝑞𝑢𝑒𝑠𝑡,𝑟𝑒𝑠𝑢𝑙𝑡})
-                    let cmd_for_synced_log = omnipaxos::ReleasedEntry {
+                    let cmd_for_synced_log = ReleasedEntry {
                         entry: cmd.entry.clone(),
                         log_id: cmd.log_id,
                         hash: cmd.hash.clone(),
                     };
                     self.omnipaxos.append_synced_log(cmd_for_synced_log, result.clone());
                     let hash = self.omnipaxos.hash_synced_log();
+
+                    // For log modification
+                    let synced_log_id = cmd.log_id;
+                    let synced_deadline = cmd.entry.deadline;
+                    let command_id = cmd.entry.id.clone();
+                    let client_id = cmd.entry.client_id.clone();
+                    self.broadcast_log_modification(epoch, client_id, command_id, synced_deadline, synced_log_id);
 
 
                     // Broadcast log modification?
@@ -430,6 +437,16 @@ impl OmniPaxosServer {
                 /* ClusterMessage::LogModification {
                     // self.omnipaxos.syncModified(cmd);
                 } */
+                ClusterMessage::LogModification {
+                    epoch,
+                    client_id,
+                    command_id,
+                    deadline,
+                    log_id,
+                    proxy_id,
+                } => {
+                    self.handle_log_modification(epoch, client_id, command_id, deadline, log_id, proxy_id);
+                }
             }
         }
         self.send_outgoing_msgs();
@@ -596,8 +613,22 @@ impl OmniPaxosServer {
         self.database.handle_command(command.kv_cmd.clone())
     }
 
-    fn broadcast_log_modification(&self) {
-        todo!()
+    fn broadcast_log_modification(&mut self, epoch: Ballot, client_id: ClientId, command_id: CommandId, deadline: i64, log_id: usize) {
+        let peers: Vec<NodeId> = self.peers.clone();
+        let proxy_id: NodeId = self.id;
+        for peer in peers {
+            self.network.send_to_cluster(
+                peer,
+                ClusterMessage::LogModification {
+                    epoch,
+                    client_id,
+                    command_id,
+                    deadline,
+                    log_id,
+                    proxy_id
+                }
+            )
+        }
     }
 
     fn handle_leader_fast_reply(
@@ -757,5 +788,9 @@ impl OmniPaxosServer {
 
     fn handle_local_follower_fast_reply(&mut self, entry: ReleasedEntry<Command>, epoch: Ballot) {
         self.handle_follower_fast_reply(self.id, entry.entry.id, entry.entry.client_id, epoch, entry.hash.expect("Local follower fast reply missing hash")) // Followers always have hash
+    }
+
+    fn handle_log_modification(&self, epoch: Ballot, client_id: ClientId, command_id: CommandId, deadline: i64, log_id: usize, proxy_id: NodeId) {
+       //self.omnipaxos.handle_log_modification(epoch, client_id, command_id, deadline, log_id, proxy_id);
     }
 }
