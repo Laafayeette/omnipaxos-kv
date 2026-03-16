@@ -87,6 +87,9 @@ pub mod kv {
         fn id(&self) -> usize {
             self.id
         }
+        fn set_deadline(&mut self, deadline: i64) {
+            self.deadline = deadline;
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
