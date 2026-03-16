@@ -693,7 +693,60 @@ impl OmniPaxosServer {
     }
 
     fn try_complete_fast_path(&mut self, client_id: ClientId, command_id: CommandId) {
+        let key = (client_id, command_id);
 
+        let response = {
+            let Some(record) = self.quorum_records.get(&key) else {
+                return;
+            };
 
+            if record.proxy_has_completed {
+                return;
+            }
+
+            let Some(leader_reply) = &record.leader_reply else {
+                return;
+            };
+
+            // Count amount of matching hashes from leader with followers.
+            let matching_follower_count = record
+                .follower_hashes
+                .values()
+                .filter(|hash| **hash == leader_reply.hash)
+                .count();
+
+            // Nezha fast quorum for n = 2f + 1 replicas:
+            // fast_quorum = f + floor(f / 2) + 1
+            let n = self.peers.len() + 1; // peers + self
+            let f = (n - 1) / 2;
+            let fast_quorum = f + f.div_ceil(2) + 1;
+
+            let total_matching = 1 + matching_follower_count;  // include leader's hash
+
+            if total_matching < fast_quorum {
+                return;
+            }
+
+            // Evaluate the leader's execution result as the response at row 698
+            Self::response_from_exec_result(command_id, leader_reply)
+        };
+
+        let Some(record) = self.quorum_records.get_mut(&key) else {
+            return;
+        };
+
+        if record.proxy_has_completed {
+            return;
+        }
+
+        record.proxy_has_completed = true;
+        self.network.send_to_client(client_id, response);
+    }
+
+    fn response_from_exec_result(command_id: CommandId, leader_reply: &LeaderReplyRecord) -> ServerMessage {
+        match leader_reply.result.clone() {
+            Some(read_result) => ServerMessage::Read(command_id, read_result),
+            None => ServerMessage::Write(command_id),
+        }
     }
 }
