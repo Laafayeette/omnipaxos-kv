@@ -78,6 +78,15 @@ pub mod kv {
         fn deadline(&self) -> i64 {
             self.deadline
         }
+        fn client_id(&self) -> u64 {
+            self.client_id
+        }
+        fn coordinator_id(&self) -> u64 {
+            self.coordinator_id
+        }
+        fn id(&self) -> usize {
+            self.id
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
