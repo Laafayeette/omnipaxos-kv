@@ -416,7 +416,7 @@ impl OmniPaxosServer {
                 } => {
                     self.handle_follower_fast_reply(from, command_id, client_id, epoch, hash);
 
-                }
+                },
                 ClusterMessage::LeaderFastReply {
                     from,
                     command_id,
@@ -425,11 +425,11 @@ impl OmniPaxosServer {
                     result,
                     hash,
                 } => {
-                    self.handle_leader_fast_reply(from, command_id, client_id, epoch, result, hash)
-                }
-                /**ClusterMessage::LogModification {
+                    self.handle_leader_fast_reply(from, command_id, client_id, epoch, result, hash);
+                },
+                /* ClusterMessage::LogModification {
                     // self.omnipaxos.syncModified(cmd);
-                }*/
+                } */
             }
         }
         self.send_outgoing_msgs();
