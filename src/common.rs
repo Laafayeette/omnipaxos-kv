@@ -51,6 +51,12 @@ pub mod messages {
             log_id: usize,
             proxy_id: NodeId,
         },
+        SlowReply {
+            from: NodeId,
+            client_id: ClientId,
+            command_id: CommandId,
+            epoch: Ballot,
+        },
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
