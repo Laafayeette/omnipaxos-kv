@@ -1,5 +1,4 @@
 use crate::{configs::OmniPaxosKVConfig, database::Database, network::Network};
-use omnipaxos_kv::clock::ClockSimulator;
 use chrono::Utc;
 use log::*;
 use omnipaxos::{
@@ -43,7 +42,6 @@ pub struct OmniPaxosServer {
 
     early_buffer_sleep: Pin<Box<Sleep>>,
     early_buffer_timer_armed: bool,
-    clock: ClockSimulator,
     // Receiver-owned sliding windows: one window per sender
     owd_states: HashMap<NodeId, PeerOWDState>,
     // Sender-owned latest estimate returned by each peer's receiver
@@ -53,12 +51,14 @@ pub struct OmniPaxosServer {
 }
 
 impl OmniPaxosServer {
-    pub async fn new(config: OmniPaxosKVConfig, clock: ClockSimulator) -> Self {
+    pub async fn new(config: OmniPaxosKVConfig) -> Self {
         // Initialize OmniPaxos instance
         let storage: MemoryStorage<Command> = MemoryStorage::default();
         let omnipaxos_config: OmniPaxosConfig = config.clone().into();
         let omnipaxos_msg_buffer = Vec::with_capacity(omnipaxos_config.server_config.buffer_size);
-        let omnipaxos = omnipaxos_config.build(storage).unwrap();
+        // Create ONE ClockSimulator from config — passed into OmniPaxos as the single shared instance.
+        let clock = omnipaxos_config.server_config.clock.clone().build();
+        let omnipaxos = omnipaxos_config.build(storage, clock).unwrap();
         // Waits for client and server network connections to be established
         let network = Network::new(config.clone(), NETWORK_BATCH_SIZE).await;
         let peers = config.get_peers(config.local.server_id);
@@ -82,7 +82,6 @@ impl OmniPaxosServer {
             omnipaxos,
             current_decided_idx: 0,
             omnipaxos_msg_buffer,
-            clock,
             owd_states,
             deadline_send_array,
             receiver_d_cap,
@@ -230,8 +229,8 @@ impl OmniPaxosServer {
     }
 
     async fn handle_client_messages(&mut self, messages: &mut Vec<(ClientId, ClientMessage)>) {
-        let send_time = self.clock.get_time();
-        let sigma_s = self.clock.get_uncertainty();
+        let send_time = self.omnipaxos.get_time();
+        let sigma_s = self.omnipaxos.get_uncertainty();
         // Deadline = now + max OWD estimate across all peers (µs)
         // Use estimates previously returned by receivers — not local windows.
         // Current request must not wait for new feedback (preserves 1 RTT fast path).
@@ -285,7 +284,7 @@ impl OmniPaxosServer {
                 }
                 ClusterMessage::OWDProbe { send_time, sender_uncertainty } => {
                     // Bootstrap probe: receiver records sample, estimates OWD, sends feedback.
-                    let raw_owd = self.clock.get_time() - send_time;
+                    let raw_owd = self.omnipaxos.get_time() - send_time;
                     self.record_owd_sample(from, raw_owd);
                     self.update_receiver_d_cap(from);
                     let est = self.estimate_owd(from, sender_uncertainty);
@@ -298,7 +297,7 @@ impl OmniPaxosServer {
                 ClusterMessage::MulticastClientMessage { client_id, message, deadline, sent_time, sender_uncertainty, coordinator_id } => {
                     // Receiver: update sliding window, adapt D_cap, compute estimate, send feedback.
                     // This is for SUBSEQUENT deadlines, current request proceeds immediately.
-                    let raw_owd = self.clock.get_time() - sent_time;
+                    let raw_owd = self.omnipaxos.get_time() - sent_time;
                     self.record_owd_sample(from, raw_owd);
                     self.update_receiver_d_cap(from);
                     let est = self.estimate_owd(from, sender_uncertainty);
@@ -352,7 +351,7 @@ impl OmniPaxosServer {
 
     /// Sends one OWDProbe to every peer whose window is not yet full.
     fn send_owd_probes(&mut self) {
-        let send_time = self.clock.get_time();
+        let send_time = self.omnipaxos.get_time();
         let peers: Vec<NodeId> = self.peers.clone();
         for peer in peers {
             let window_full = self.owd_states
@@ -362,7 +361,7 @@ impl OmniPaxosServer {
             if !window_full {
                 self.network.send_to_cluster(peer, ClusterMessage::OWDProbe {
                     send_time,
-                    sender_uncertainty: self.clock.get_uncertainty(),
+                    sender_uncertainty: self.omnipaxos.get_uncertainty(),
                 });
             }
         }
@@ -426,7 +425,7 @@ impl OmniPaxosServer {
         sorted.sort_unstable();
         let idx = ((sorted.len() as f64 * 0.95).ceil() as usize).saturating_sub(1);
         let p = sorted[idx.min(sorted.len() - 1)];
-        let sigma_r = self.clock.get_uncertainty();
+        let sigma_r = self.omnipaxos.get_uncertainty();
         let est = p + (OWD_BETA * ((sender_uncertainty + sigma_r) as f64)) as i64;
         est.max(1).min(d_cap)
     }
