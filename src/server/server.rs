@@ -1,7 +1,6 @@
 use crate::{configs::OmniPaxosKVConfig, database::Database, network::Network};
 use chrono::Utc;
 use log::*;
-use omnipaxos::{OmniPaxos, OmniPaxosConfig, messages::Message, util::{LogEntry, NodeId}, ProcessEarlyBufferResult};
 use omnipaxos::{OmniPaxos, OmniPaxosConfig, messages::Message, util::{LogEntry, NodeId}, ProcessEarlyBufferResult, FastHash};
 use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
 use omnipaxos_storage::memory_storage::MemoryStorage;
