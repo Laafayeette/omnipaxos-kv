@@ -46,8 +46,6 @@ pub struct OmniPaxosServer {
     owd_states: HashMap<NodeId, PeerOWDState>,
     // Sender-owned latest estimate returned by each peer's receiver
     deadline_send_array: HashMap<NodeId, i64>,
-    // Receiver-owned adaptive D_cap per sender
-    receiver_d_cap: HashMap<NodeId, i64>,
 }
 
 impl OmniPaxosServer {
@@ -74,7 +72,6 @@ impl OmniPaxosServer {
             })
             .collect();
         let deadline_send_array: HashMap<NodeId, i64> = peers.iter().map(|&p| (p, OWD_D_CAP)).collect();
-        let receiver_d_cap: HashMap<NodeId, i64> = peers.iter().map(|&p| (p, OWD_D_CAP)).collect();
         OmniPaxosServer {
             id: config.local.server_id,
             database: Database::new(),
@@ -84,7 +81,6 @@ impl OmniPaxosServer {
             omnipaxos_msg_buffer,
             owd_states,
             deadline_send_array,
-            receiver_d_cap,
             peers,
             config,
 
@@ -291,7 +287,6 @@ impl OmniPaxosServer {
                     // Bootstrap probe: receiver records sample, estimates OWD, sends feedback.
                     let raw_owd = self.omnipaxos.get_time() - send_time;
                     self.record_owd_sample(from, raw_owd);
-                    self.update_receiver_d_cap(from);
                     let est = self.estimate_owd(from, sender_uncertainty);
                     self.network.send_to_cluster(from, ClusterMessage::OWDFeedback { estimated_owd: est });
                 }
@@ -304,7 +299,6 @@ impl OmniPaxosServer {
                     // This is for SUBSEQUENT deadlines, current request proceeds immediately.
                     let raw_owd = self.omnipaxos.get_time() - sent_time;
                     self.record_owd_sample(from, raw_owd);
-                    self.update_receiver_d_cap(from);
                     let est = self.estimate_owd(from, sender_uncertainty);
                     self.network.send_to_cluster(from, ClusterMessage::OWDFeedback { estimated_owd: est });
                     debug!("{}: Received multicast from {} deadline={} µs raw_owd={} µs", self.id, from, deadline, raw_owd);
@@ -389,18 +383,6 @@ impl OmniPaxosServer {
         );
     }
 
-    /// Adaptively grows D_cap for `sender` if observed delays exceed the current cap.
-    fn update_receiver_d_cap(&mut self, sender: NodeId) {
-        let window_max = self.owd_states.get(&sender)
-            .and_then(|s| s.window.iter().cloned().max())
-            .unwrap_or(0);
-        let adaptive = (window_max as f64 * 1.2) as i64;
-        let entry = self.receiver_d_cap.entry(sender).or_insert(OWD_D_CAP);
-        if adaptive > *entry {
-            *entry = adaptive;
-        }
-    }
-
     /// Returns true once every peer's D_cap has been refined by at least one real sample.
     fn owd_probing_complete(&self) -> bool {
         self.peers.iter().all(|p| {
@@ -420,10 +402,9 @@ impl OmniPaxosServer {
     }
 
     pub fn estimate_owd(&self, peer: NodeId, sender_uncertainty: i64) -> i64 {
-        let d_cap = *self.receiver_d_cap.get(&peer).unwrap_or(&OWD_D_CAP);
         let state = match self.owd_states.get(&peer) {
             Some(s) if !s.window.is_empty() => s,
-            _ => return d_cap,
+            _ => return OWD_D_CAP,
         };
         // P = p95 of whatever samples are in the window (works for any window size ≥ 1).
         let mut sorted: Vec<i64> = state.window.iter().cloned().collect();
@@ -432,7 +413,12 @@ impl OmniPaxosServer {
         let p = sorted[idx.min(sorted.len() - 1)];
         let sigma_r = self.omnipaxos.get_uncertainty();
         let est = p + (OWD_BETA * ((sender_uncertainty + sigma_r) as f64)) as i64;
-        est.max(1).min(d_cap)
+        // Paper: clamp to D if est <= 0 or est >= D
+        if est <= 0 || est >= OWD_D_CAP {
+            OWD_D_CAP
+        } else {
+            est
+        }
     }
 
     // ------------------Save the output ----------------------------------------------------
