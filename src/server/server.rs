@@ -1,7 +1,7 @@
 use crate::{configs::OmniPaxosKVConfig, database::Database, network::Network};
 use chrono::Utc;
 use log::*;
-use omnipaxos::{OmniPaxos, OmniPaxosConfig, messages::Message, util::{LogEntry, NodeId}, ProcessEarlyBufferResult, FastHash};
+use omnipaxos::{OmniPaxos, OmniPaxosConfig, messages::Message, util::{LogEntry, NodeId}, ProcessEarlyBufferResult, FastHash, ReleasedEntry};
 use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
 use omnipaxos_storage::memory_storage::MemoryStorage;
 use std::pin::Pin;
@@ -200,6 +200,7 @@ impl OmniPaxosServer {
             Some(epoch) => {
                 for cmd in released_entries {
                     let result = self.execute_on_state_machine(&cmd.entry);
+
                     let coordinator_id = cmd.entry.coordinator_id;
                     let command_id = cmd.entry.id;
                     let client_id = cmd.entry.client_id;
@@ -219,7 +220,7 @@ impl OmniPaxosServer {
                     //self.broadcast_log_modification();
 
                     if coordinator_id == self.id { // If I am proxy for this message.
-                        self.handle_local_leader_execution_reply(cmd, epoch, result);
+                        self.handle_local_leader_execution_reply(cmd, epoch, result, hash);
                     }
                     else {
                         self.network.send_to_cluster( // Send ack back to proxy with result.
@@ -245,7 +246,7 @@ impl OmniPaxosServer {
                     let hash = cmd.hash;
 
                     if coordinator_id == self.id { // If I am proxy for this message.
-                        self.handle_local_follower_fast_reply(cmd);
+                        self.handle_local_follower_fast_reply(cmd, reply_epoch);
                     } else {
                         self.network.send_to_cluster(
                             coordinator_id,
@@ -748,5 +749,13 @@ impl OmniPaxosServer {
             Some(read_result) => ServerMessage::Read(command_id, read_result),
             None => ServerMessage::Write(command_id),
         }
+    }
+
+    fn handle_local_leader_execution_reply(&mut self, entry: ReleasedEntry<Command>, epoch: Ballot, result: Option<Option<String>>, hash: FastHash) {
+        self.handle_leader_fast_reply(self.id, entry.entry.id, entry.entry.client_id, epoch, result, hash)
+    }
+
+    fn handle_local_follower_fast_reply(&mut self, entry: ReleasedEntry<Command>, epoch: Ballot) {
+        self.handle_follower_fast_reply(self.id, entry.entry.id, entry.entry.client_id, epoch, entry.hash.expect("Local follower fast reply missing hash")) // Followers always have hash
     }
 }
