@@ -1,9 +1,7 @@
 use crate::{configs::OmniPaxosKVConfig, database::Database, network::Network};
 use chrono::Utc;
 use log::*;
-use omnipaxos::{
-    OmniPaxos, OmniPaxosConfig, messages::Message, util::{LogEntry, NodeId}
-};
+use omnipaxos::{OmniPaxos, OmniPaxosConfig, messages::Message, util::{LogEntry, NodeId}, ProcessEarlyBufferResult, FastHash, ReleasedEntry};
 use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
 use omnipaxos_storage::memory_storage::MemoryStorage;
 use std::pin::Pin;
@@ -15,6 +13,7 @@ use std::{
     io::Write,
     time::Duration,
 };
+use omnipaxos::ballot_leader_election::Ballot;
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 const NETWORK_BATCH_SIZE: usize = 100;
@@ -28,6 +27,22 @@ const OWD_D_CAP: i64 = 10_000;
 
 struct PeerOWDState {
     window: VecDeque<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct LeaderReplyRecord {
+    from: NodeId,
+    epoch: Ballot,
+    result: Option<Option<String>>,
+    hash: FastHash,
+}
+
+#[derive(Debug, Clone)]
+struct QuorumRecord {
+    epoch: Option<Ballot>,
+    leader_reply: Option<LeaderReplyRecord>,
+    follower_hashes: HashMap<NodeId, FastHash>,
+    proxy_has_completed: bool,
 }
 
 pub struct OmniPaxosServer {
@@ -46,6 +61,7 @@ pub struct OmniPaxosServer {
     owd_states: HashMap<NodeId, PeerOWDState>,
     // Sender-owned latest estimate returned by each peer's receiver
     deadline_send_array: HashMap<NodeId, i64>,
+    quorum_records: HashMap<(ClientId, CommandId), QuorumRecord>,
 }
 
 impl OmniPaxosServer {
@@ -86,6 +102,7 @@ impl OmniPaxosServer {
 
             early_buffer_sleep: Box::pin(sleep(Duration::from_secs(24 * 60 * 60 * 365))),
             early_buffer_timer_armed: false,
+            quorum_records: Default::default(),
         }
     }
 
@@ -124,7 +141,8 @@ impl OmniPaxosServer {
                 },
 
                 _ = &mut self.early_buffer_sleep, if self.early_buffer_timer_armed => {
-                self.omnipaxos.process_early_buffer();
+                let released_buffer = self.omnipaxos.process_early_buffer();
+                self.handle_released_entries(released_buffer);
                 self.reset_early_buffer_timer();
                 self.send_outgoing_msgs();
                 },
@@ -166,6 +184,89 @@ impl OmniPaxosServer {
                 _ = self.network.client_messages.recv_many(client_msg_buffer, NETWORK_BATCH_SIZE) => {
                     self.handle_client_messages(client_msg_buffer).await;
                 },
+            }
+        }
+    }
+
+    fn handle_released_entries(&mut self, released_buffer: ProcessEarlyBufferResult<Command>) {
+        let ProcessEarlyBufferResult {
+            released_entries,
+            leader_exec_epoch,
+            reply_epoch,
+        } = released_buffer;
+
+        match leader_exec_epoch {
+            // I am leader for these popped entries, then I must execute, append to synced_log, and hash.
+            Some(epoch) => {
+                for cmd in released_entries {
+                    let result = self.execute_on_state_machine(&cmd.entry);
+
+                    let coordinator_id = cmd.entry.coordinator_id;
+                    let command_id = cmd.entry.id;
+                    let client_id = cmd.entry.client_id;
+
+                    // synced-log.append({𝑟𝑒𝑞𝑢𝑒𝑠𝑡,𝑟𝑒𝑠𝑢𝑙𝑡})
+                    let cmd_for_synced_log = ReleasedEntry {
+                        entry: cmd.entry.clone(),
+                        log_id: cmd.log_id,
+                        hash: cmd.hash.clone(),
+                    };
+                    self.omnipaxos.append_synced_log(cmd_for_synced_log, result.clone());
+                    let hash = self.omnipaxos.hash_synced_log();
+
+                    // For log modification
+                    let synced_log_id = cmd.log_id;
+                    let synced_deadline = cmd.entry.deadline;
+                    let command_id = cmd.entry.id.clone();
+                    let client_id = cmd.entry.client_id.clone();
+                    self.broadcast_log_modification(epoch, client_id, command_id, synced_deadline, synced_log_id);
+
+
+                    // Broadcast log modification?
+                    //self.append_log_modification_entry(ersu)
+                    //self.broadcast_log_modification();
+
+                    if coordinator_id == self.id { // If I am proxy for this message.
+                        self.handle_local_leader_execution_reply(cmd, epoch, result, hash);
+                    }
+                    else {
+                        self.network.send_to_cluster( // Send ack back to proxy with result.
+                            coordinator_id,
+                            ClusterMessage::LeaderFastReply {
+                                from: self.id,
+                                command_id,
+                                client_id,
+                                epoch,
+                                result,
+                                hash,
+                            },
+                        );
+                    }
+                }
+            }
+            None => { // I am follower for these popped entries.
+                for cmd in released_entries {
+                    // I am follower
+                    let coordinator_id = cmd.entry.coordinator_id;
+                    let command_id = cmd.entry.id;
+                    let client_id = cmd.entry.client_id;
+                    let hash = cmd.hash;
+
+                    if coordinator_id == self.id { // If I am proxy for this message.
+                        self.handle_local_follower_fast_reply(cmd, reply_epoch);
+                    } else {
+                        self.network.send_to_cluster(
+                            coordinator_id,
+                            ClusterMessage::FollowerFastReply {
+                                from: self.id,
+                                command_id,
+                                client_id,
+                                epoch: reply_epoch,
+                                hash: hash.expect("Hash could not be extracted"),
+                            },
+                        );
+                    }
+                }
             }
         }
     }
@@ -257,6 +358,15 @@ impl OmniPaxosServer {
             // Append to local OmniPaxos log
             match message {
                 ClientMessage::Append(command_id, kv_command) => {
+                    self.quorum_records.insert(
+                        (from, command_id),
+                        QuorumRecord {
+                            epoch: None,
+                            leader_reply: None,
+                            follower_hashes: HashMap::new(),
+                            proxy_has_completed: false,
+                        },
+                    );
                     self.append_to_log(from, command_id, kv_command, deadline, self.id);
                     self.reset_early_buffer_timer();
                 }
@@ -305,8 +415,37 @@ impl OmniPaxosServer {
                     match message {
                         ClientMessage::Append(command_id, kv_command) => {
                             self.append_to_log(client_id, command_id, kv_command, deadline, coordinator_id);
+                            self.reset_early_buffer_timer();
                         }
                     }
+                }
+                ClusterMessage::FollowerFastReply { from, command_id, client_id, epoch, hash
+                } => {
+                    self.handle_follower_fast_reply(from, command_id, client_id, epoch, hash);
+
+                },
+                ClusterMessage::LeaderFastReply {
+                    from,
+                    command_id,
+                    client_id,
+                    epoch,
+                    result,
+                    hash,
+                } => {
+                    self.handle_leader_fast_reply(from, command_id, client_id, epoch, result, hash);
+                },
+                /* ClusterMessage::LogModification {
+                    // self.omnipaxos.syncModified(cmd);
+                } */
+                ClusterMessage::LogModification {
+                    epoch,
+                    client_id,
+                    command_id,
+                    deadline,
+                    log_id,
+                    proxy_id,
+                } => {
+                    self.handle_log_modification(epoch, client_id, command_id, deadline, log_id, proxy_id);
                 }
             }
         }
@@ -323,9 +462,7 @@ impl OmniPaxosServer {
             kv_cmd: kv_command,
             deadline: deadline,
         };
-        self.omnipaxos
-            .append(command)
-            .expect("Append to Omnipaxos log failed");
+        self.omnipaxos.append_nezha(command).expect("Nezha append failed failed.")
     }
 
     fn send_cluster_start_signals(&mut self, start_time: Timestamp) {
@@ -470,5 +607,190 @@ impl OmniPaxosServer {
         output_file.write_all(config_json.as_bytes())?;
         output_file.flush()?;
         Ok(())
+    }
+
+    fn execute_on_state_machine(&mut self, command: &Command) -> Option<Option<String>> {
+        self.database.handle_command(command.kv_cmd.clone())
+    }
+
+    fn broadcast_log_modification(&mut self, epoch: Ballot, client_id: ClientId, command_id: CommandId, deadline: i64, log_id: usize) {
+        let peers: Vec<NodeId> = self.peers.clone();
+        let proxy_id: NodeId = self.id;
+        for peer in peers {
+            self.network.send_to_cluster(
+                peer,
+                ClusterMessage::LogModification {
+                    epoch,
+                    client_id,
+                    command_id,
+                    deadline,
+                    log_id,
+                    proxy_id
+                }
+            )
+        }
+    }
+
+    fn handle_leader_fast_reply(
+        &mut self,
+        node_id: NodeId,
+        command_id: CommandId,
+        client_id: ClientId,
+        epoch: Ballot,
+        result: Option<Option<String>>, hash: FastHash)
+    {
+        let key = (client_id, command_id);
+
+        let Some(record) =
+            self.quorum_records.get_mut(&key)
+        else {
+            return;
+        };
+
+        // If request already has been completed (committed) by this proxy before
+        if record.proxy_has_completed {
+            return;
+        }
+
+        if Self::check_if_stale_epoch(epoch, record) { return; }
+
+        // If there is an existing recorded leader reply and it is duplicate then return.
+        if let Some(recorded_leader_reply) = &record.leader_reply {
+            if recorded_leader_reply.from == node_id && recorded_leader_reply.epoch == epoch {
+                return;
+            }
+        }
+
+        record.leader_reply = Some(LeaderReplyRecord {
+            from: node_id,
+            epoch,
+            result,
+            hash,
+        });
+
+        self.try_complete_fast_path(client_id, command_id);
+
+    }
+
+    fn check_if_stale_epoch(epoch: Ballot, record: &mut QuorumRecord) -> bool {
+        match record.epoch {
+            None => {
+                record.epoch = Some(epoch); // First epoch of this request
+            }
+            Some(epoch_in_record) if epoch < epoch_in_record => {
+                return true; // stale reply
+            }
+            Some(epoch_in_record) if epoch > epoch_in_record => {
+                // newer epoch replaces old reply set
+                record.epoch = Some(epoch);
+                record.leader_reply = None;
+                record.follower_hashes.clear();
+            }
+            Some(_) => {}
+        }
+        false
+    }
+
+    fn handle_follower_fast_reply(
+        &mut self,
+        node_id: NodeId,
+        command_id: CommandId,
+        client_id: ClientId,
+        epoch: Ballot,
+        hash: FastHash,
+    ) {
+        let key = (client_id, command_id);
+
+        let Some(record) = self.quorum_records.get_mut(&key) else {
+            return;
+        };
+
+        // Already completed by this proxy
+        if record.proxy_has_completed {
+            return;
+        }
+
+        if Self::check_if_stale_epoch(epoch, record) { return; }
+
+        // Duplicate follower reply from same node in same epoch
+        if record.follower_hashes.contains_key(&node_id) {
+            return;
+        }
+
+        // All good, store follower's hash
+        record.follower_hashes.insert(node_id, hash);
+
+        // Try checking for fast-path quorum
+        self.try_complete_fast_path(client_id, command_id);
+    }
+
+    fn try_complete_fast_path(&mut self, client_id: ClientId, command_id: CommandId) {
+        let key = (client_id, command_id);
+
+        let response = {
+            let Some(record) = self.quorum_records.get(&key) else {
+                return;
+            };
+
+            if record.proxy_has_completed {
+                return;
+            }
+
+            let Some(leader_reply) = &record.leader_reply else {
+                return;
+            };
+
+            // Count amount of matching hashes from leader with followers.
+            let matching_follower_count = record
+                .follower_hashes
+                .values()
+                .filter(|hash| **hash == leader_reply.hash)
+                .count();
+
+            // Nezha fast quorum for n = 2f + 1 replicas:
+            // fast_quorum = f + floor(f / 2) + 1
+            let n = self.peers.len() + 1; // peers + self
+            let f = (n - 1) / 2;
+            let fast_quorum = f + f.div_ceil(2) + 1;
+
+            let total_matching = 1 + matching_follower_count;  // include leader's hash
+
+            if total_matching < fast_quorum {
+                return;
+            }
+
+            // Evaluate the leader's execution result as the response at row 698
+            Self::response_from_exec_result(command_id, leader_reply)
+        };
+
+        let Some(record) = self.quorum_records.get_mut(&key) else {
+            return;
+        };
+
+        if record.proxy_has_completed {
+            return;
+        }
+
+        record.proxy_has_completed = true;
+        self.network.send_to_client(client_id, response);
+    }
+
+    fn response_from_exec_result(command_id: CommandId, leader_reply: &LeaderReplyRecord) -> ServerMessage {
+        match leader_reply.result.clone() {
+            Some(read_result) => ServerMessage::Read(command_id, read_result),
+            None => ServerMessage::Write(command_id),
+        }
+    }
+
+    fn handle_local_leader_execution_reply(&mut self, entry: ReleasedEntry<Command>, epoch: Ballot, result: Option<Option<String>>, hash: FastHash) {
+        self.handle_leader_fast_reply(self.id, entry.entry.id, entry.entry.client_id, epoch, result, hash)
+    }
+
+    fn handle_local_follower_fast_reply(&mut self, entry: ReleasedEntry<Command>, epoch: Ballot) {
+        self.handle_follower_fast_reply(self.id, entry.entry.id, entry.entry.client_id, epoch, entry.hash.expect("Local follower fast reply missing hash")) // Followers always have hash
+    }
+
+    fn handle_log_modification(&self, epoch: Ballot, client_id: ClientId, command_id: CommandId, deadline: i64, log_id: usize, proxy_id: NodeId) {
+       //self.omnipaxos.handle_log_modification(epoch, client_id, command_id, deadline, log_id, proxy_id);
     }
 }
