@@ -64,6 +64,9 @@ pub struct OmniPaxosServer {
     // Sender-owned latest estimate returned by each peer's receiver
     deadline_send_array: HashMap<NodeId, i64>,
     quorum_records: HashMap<(ClientId, CommandId), QuorumRecord>,
+    // Tracks entries that came from the late buffer so we only broadcast
+    // LogModification for slow-path entries (paper §5, Figure 5).
+    late_entry_ids: HashSet<(ClientId, CommandId)>,
     fast_path_count: usize,
     slow_path_count: usize,
 }
@@ -107,6 +110,7 @@ impl OmniPaxosServer {
             early_buffer_sleep: Box::pin(sleep(Duration::from_secs(24 * 60 * 60 * 365))),
             early_buffer_timer_armed: false,
             quorum_records: Default::default(),
+            late_entry_ids: HashSet::new(),
             fast_path_count: 0,
             slow_path_count: 0,
         }
@@ -138,12 +142,8 @@ impl OmniPaxosServer {
                 },
                 _ = election_interval.tick() => {
                     self.omnipaxos.tick();
-                    if self.omnipaxos.get_current_leader()
-                        .map(|(id, ready)| id == self.id && ready)
-                        .unwrap_or(false)
-                    {
-                        self.omnipaxos.process_late_buffer();
-                        self.reset_early_buffer_timer();
+                    if self.is_leader() {
+                        self.process_leader_late_buffer();
                     }
                     self.send_outgoing_msgs();
                 },
@@ -154,15 +154,22 @@ impl OmniPaxosServer {
                     self.send_owd_probes();
                     if self.owd_probing_complete() {
                         info!("{}: OWD windows full — D={} µs, probing complete", self.id, OWD_D_CAP);
-                        self.save_output().expect("Failed to write output");
                         owd_complete = true;
                     }
                 },
                 _ = self.network.cluster_messages.recv_many(&mut cluster_msg_buf, NETWORK_BATCH_SIZE) => {
                     self.handle_cluster_messages(&mut cluster_msg_buf).await;
+                    // Leader should promptly drain its late buffer after new
+                    // entries may have arrived (paper §5: slow-path latency).
+                    if self.is_leader() {
+                        self.process_leader_late_buffer();
+                    }
                 },
                 _ = self.network.client_messages.recv_many(&mut client_msg_buf, NETWORK_BATCH_SIZE) => {
                     self.handle_client_messages(&mut client_msg_buf).await;
+                    if self.is_leader() {
+                        self.process_leader_late_buffer();
+                    }
                 },
 
                 _ = &mut self.early_buffer_sleep, if self.early_buffer_timer_armed => {
@@ -227,8 +234,6 @@ impl OmniPaxosServer {
                     let result = self.execute_on_state_machine(&cmd.entry);
 
                     let coordinator_id = cmd.entry.coordinator_id;
-                    let command_id = cmd.entry.id;
-                    let client_id = cmd.entry.client_id;
 
                     // synced-log.append({𝑟𝑒𝑞𝑢𝑒𝑠𝑡,𝑟𝑒𝑠𝑢𝑙𝑡})
                     let cmd_for_synced_log = ReleasedEntry {
@@ -241,14 +246,16 @@ impl OmniPaxosServer {
 
                     let synced_log_id = cmd.log_id;
                     let synced_deadline = cmd.entry.deadline;
-                    let command_id = cmd.entry.id.clone();
-                    let client_id = cmd.entry.client_id.clone();
-                    self.broadcast_log_modification(epoch, client_id, command_id, synced_deadline, synced_log_id, coordinator_id);
+                    let command_id = cmd.entry.id;
+                    let client_id = cmd.entry.client_id;
 
-
-                    // Broadcast log modification?
-                    //self.append_log_modification_entry(ersu)
-                    //self.broadcast_log_modification();
+                    // Only broadcast LogModification for entries that came from
+                    // the late buffer (slow path).  On-time entries don't need
+                    // modification — DOM already ensures consistent ordering
+                    // across replicas (paper §4, Figure 4 vs Figure 5).
+                    if self.late_entry_ids.remove(&(client_id, command_id)) {
+                        self.broadcast_log_modification(epoch, client_id, command_id, synced_deadline, synced_log_id, coordinator_id);
+                    }
 
                     if coordinator_id == self.id { // If I am proxy for this message.
                         self.handle_local_leader_execution_reply(cmd, epoch, result, hash);
@@ -270,11 +277,14 @@ impl OmniPaxosServer {
             }
             None => { // I am follower for these popped entries.
                 for cmd in released_entries {
-                    // I am follower
                     let coordinator_id = cmd.entry.coordinator_id;
                     let command_id = cmd.entry.id;
                     let client_id = cmd.entry.client_id;
+                    let deadline = cmd.entry.deadline;
                     let hash = cmd.hash;
+
+                    // Promote from unsynced_log → synced_log (safe: XOR hash unchanged).
+                    self.omnipaxos.promote_to_synced(client_id, command_id, deadline);
 
                     if coordinator_id == self.id { // If I am proxy for this message.
                         self.handle_local_follower_fast_reply(cmd, reply_epoch);
@@ -292,6 +302,25 @@ impl OmniPaxosServer {
                     }
                 }
             }
+        }
+    }
+
+    fn is_leader(&self) -> bool {
+        self.omnipaxos.get_current_leader()
+            .map(|(id, ready)| id == self.id && ready)
+            .unwrap_or(false)
+    }
+
+    /// Drains the late buffer, moves entries into the early buffer with new
+    /// deadlines, and records their identities so `handle_released_entries`
+    /// only broadcasts `LogModification` for these slow-path entries.
+    fn process_leader_late_buffer(&mut self) {
+        let late_entries = self.omnipaxos.process_late_buffer();
+        for entry in &late_entries {
+            self.late_entry_ids.insert((entry.entry.client_id, entry.entry.id));
+        }
+        if !late_entries.is_empty() {
+            self.reset_early_buffer_timer();
         }
     }
 

@@ -1,0 +1,11 @@
+location = "bench-1"
+server_id = 1
+num_clients = 1
+listen_address = "127.0.0.1"
+listen_port = 8001
+output_filepath = "./logs/server-1.json"
+
+[clock]
+drift_us_per_s   = 50.0
+uncertainty      = 1000
+sync_interval_ms = 100

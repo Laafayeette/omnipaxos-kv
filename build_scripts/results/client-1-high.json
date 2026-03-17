@@ -1,0 +1,15 @@
+{
+  "location": "c1",
+  "server_id": 1,
+  "server_address": "127.0.0.1:8001",
+  "requests": [
+    {
+      "duration_sec": 5,
+      "requests_per_sec": 20,
+      "read_ratio": 0.25
+    }
+  ],
+  "sync_time": 1999,
+  "summary_filepath": "./logs/client-1.json",
+  "output_filepath": "./logs/client-1.csv"
+}

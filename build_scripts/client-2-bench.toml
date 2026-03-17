@@ -1,0 +1,17 @@
+location = "bench-client-2"
+server_id = 2
+server_address = "127.0.0.1:8002"
+summary_filepath = "./logs/client-2.json"
+output_filepath  = "./logs/client-2.csv"
+
+# warm-up phase
+[[requests]]
+duration_sec     = 1
+requests_per_sec = 10
+read_ratio       = 0.25
+
+# sustained benchmark phase
+[[requests]]
+duration_sec     = 10
+requests_per_sec = 20
+read_ratio       = 0.25
